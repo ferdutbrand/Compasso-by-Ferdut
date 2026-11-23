@@ -1,0 +1,6 @@
+{
+  "name": "Compasso – Construção Geométrica",
+  "description": "Estúdio interativo de construção geométrica euclidiana com régua, compasso, tangências e precisão ajustável de encaixe (snap).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

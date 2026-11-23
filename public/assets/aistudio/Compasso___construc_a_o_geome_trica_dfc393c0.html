@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Compasso – construção geométrica</title>
+<style>
+:root{--bg:#fafaf8;--fg:#1d1d1b;--mut:#6b6b66;--bar:#fff;--bd:#d8d8d2;--ac:#2563eb;--pt:#e11d48;--ln:#222;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161618;--fg:#eee;--mut:#9a9a94;--bar:#222226;--bd:#3a3a40;--ac:#6ea0ff;--pt:#fb7185;--ln:#ddd}}
+:root[data-theme="dark"]{--bg:#161618;--fg:#eee;--mut:#9a9a94;--bar:#222226;--bd:#3a3a40;--ac:#6ea0ff;--pt:#fb7185;--ln:#ddd}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column}
+#bar{display:flex;flex-wrap:wrap;gap:6px;padding:8px;background:var(--bar);border-bottom:1px solid var(--bd);align-items:center}
+button{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;cursor:pointer}
+button.on{background:var(--ac);border-color:var(--ac);color:#fff}
+.sp{flex:1}
+#st{padding:6px 10px;color:var(--mut);font-size:13px;border-top:1px solid var(--bd);background:var(--bar)}
+#w{flex:1;min-height:0;position:relative}
+svg *{vector-effect:non-scaling-stroke}
+#s{--ln:#000;--ac:#2563eb;--pt:#e11d48;background:#fff}
+svg{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+</style></head><body>
+<div id="bar">
+<button data-t="move" class="on">Mover (V)</button><button data-t="pt">Ponto (P)</button><button data-t="ln">Reta (L)</button><button data-t="ci">Círculo (C)</button><button data-t="cb">Círculo (borda) (B)</button><button data-t="tc">Tangente comum (T)</button><button id="tg">Tangente (Shift/S)</button><button data-t="del">Apagar (X)</button>
+<span class="sp"></span>
+<button id="dl">Excluir ponto</button><button id="pc">Limpar prioridade</button><button id="un">Desfazer</button><button id="re">Refazer</button><button id="zo">−</button><button id="zi">+</button><button id="z1">100%</button><button id="lk">Travar imagem</button><button id="rx">Remover imagem</button><button id="ex">Exemplo</button><button id="clr">Limpar</button><button id="exp">Exportar SVG</button><button id="exs">SVG transparente</button>
+</div>
+<div id="w"><svg id="s"></svg></div>
+<div id="st"></div>
+<script>
+const S=document.getElementById('s'),ST=document.getElementById('st');
+let objs=[],tool='move',pend=[],hover=null,drag=null,W=800,H=600;
+const msgs={move:'Arraste pontos livres. Pontos de interseção seguem os objetos. Shift ao arrastar um ponto o encaixa no círculo/reta próximo; selecione um ponto e use Delete para excluí-lo. Dois cliques sobre um círculo o edita: o ponto clicado vira um ponto fixo da borda; mova e clique para redefinir (Shift = tangente a até 2 objetos; Esc cancela).',pt:'Clique para criar um ponto (gruda em pontos e interseções).',ln:'Clique em 2 pontos: a reta passa por eles. Com Shift: clique em um ponto e depois perto de um círculo para traçar a reta tangente.',ci:'Clique no centro, depois no ponto por onde o círculo passa. Segure Shift no 2º clique para tornar o círculo tangente a outro círculo ou reta.',cb:'Clique num ponto da borda (ex.: o topo) e mova: esse ponto e o oposto formam o diâmetro, com encaixe em pontos. Com Shift o círculo se ajusta para ficar tangente a um círculo ou reta próximos.',tc:'Clique em dois círculos e depois clique para escolher uma das 4 tangentes comuns (a mais próxima do cursor aparece tracejada).',del:'Clique em um objeto para apagá-lo (e o que depende dele).'};
+function add(o){o.id=objs.length;objs.push(o);recalc();return o.id}
+const P=i=>objs[i];
+function curve(o){
+ if(o.t==='ln'){if(o.cc){const A=curve(P(o.cc[0])),B=curve(P(o.cc[1]));if(!A||!B)return null;return commonTan(A,B,o.s,o.tt)}if(o.to!==undefined){const a=P(o.a),K=curve(P(o.to));if(!a.ok||!K)return null;return tanLine(a,K,o.s)}const a=P(o.a),b=P(o.b);if(!a.ok||!b.ok)return null;return{t:'l',x:a.x,y:a.y,dx:b.x-a.x,dy:b.y-a.y}}
+ if(o.t==='ci'){if(o.e!==undefined){const A=P(o.e),T=curve(P(o.tan));if(!A.ok||!T)return null;
+   if(o.tan2!==undefined){const T2=curve(P(o.tan2));return T2?pccAt(A,T,o.sg,T2,o.sg2,o.kk):null}const u=[Math.cos(o.ang),Math.sin(o.ang)],r=edgeR(A,u,T,o.sg);return r===null?null:{t:'c',x:A.x+u[0]*r,y:A.y+u[1]*r,r}}
+  if(o.d1!==undefined){const a=P(o.d1),b=P(o.d2);if(!a.ok||!b.ok)return null;const r=Math.hypot(b.x-a.x,b.y-a.y)/2;return r<1e-9?null:{t:'c',x:(a.x+b.x)/2,y:(a.y+b.y)/2,r}}
+  const c=P(o.c);if(!c.ok)return null;
+  if(o.tan!==undefined){const T=curve(P(o.tan));if(!T)return null;const r=tanR(T,c.x,c.y,o.m);return r===null?null:{t:'c',x:c.x,y:c.y,r}}
+  const p=P(o.p);if(!p.ok)return null;return{t:'c',x:c.x,y:c.y,r:Math.hypot(p.x-c.x,p.y-c.y)}}
+}
+function inter(A,B,s){
+ if(!A||!B)return null;
+ if(A.t==='c'&&B.t==='l')[A,B]=[B,A];
+ if(A.t==='l'&&B.t==='l'){const d=A.dx*B.dy-A.dy*B.dx;if(Math.abs(d)<1e-12)return s>0?null:null;
+  if(s<0)return null;const t=((B.x-A.x)*B.dy-(B.y-A.y)*B.dx)/d;return[A.x+t*A.dx,A.y+t*A.dy]}
+ if(A.t==='l'&&B.t==='c'){const fx=A.x-B.x,fy=A.y-B.y,a=A.dx**2+A.dy**2,b=2*(fx*A.dx+fy*A.dy),c=fx*fx+fy*fy-B.r*B.r,D=b*b-4*a*c;
+  if(D<-1e-9*a)return null;const t=(-b+s*Math.sqrt(Math.max(D,0)))/(2*a);return[A.x+t*A.dx,A.y+t*A.dy]}
+ const dx=B.x-A.x,dy=B.y-A.y,d=Math.hypot(dx,dy);if(d<1e-12||d>A.r+B.r+1e-9||d<Math.abs(A.r-B.r)-1e-9)return null;
+ const a=(A.r*A.r-B.r*B.r+d*d)/(2*d),h=Math.sqrt(Math.max(A.r*A.r-a*a,0));
+ return[A.x+a*dx/d-s*h*dy/d,A.y+a*dy/d+s*h*dx/d];
+}
+function recalc(){for(let pass=0;pass<2;pass++)for(const o of objs){if(o.dead){o.ok=false;continue}
+ if(o.t==='pt'){if(o.free)o.ok=true;else if(o.on!==undefined){const T=curve(P(o.on));o.ok=!!T&&!P(o.on).dead;if(o.ok){if(T.t==='c'){o.x=T.x+T.r*Math.cos(o.u);o.y=T.y+T.r*Math.sin(o.u)}else{o.x=T.x+o.u*T.dx;o.y=T.y+o.u*T.dy}}}else if(o.tp){const ci=P(o.ci),tg=P(o.tg),C=curve(ci),T=curve(tg);o.ok=!!(C&&T&&!ci.dead&&!tg.dead);
+  if(o.ok){if(T.t==='l'){const t=((C.x-T.x)*T.dx+(C.y-T.y)*T.dy)/(T.dx*T.dx+T.dy*T.dy);o.x=T.x+t*T.dx;o.y=T.y+t*T.dy}
+   else{const D=Math.hypot(C.x-T.x,C.y-T.y);if(D<1e-9)o.ok=false;else{const sgv=ci.tan2!==undefined&&ci.tan2===tg.id?ci.sg2:ci.sg,k=(ci.m===2||(ci.e!==undefined&&sgv<0&&C.r>T.r))?-1:1;o.x=T.x+k*T.r*(C.x-T.x)/D;o.y=T.y+k*T.r*(C.y-T.y)/D}}}}
+  else{const r=inter(curve(P(o.a)),curve(P(o.b)),o.s);o.ok=!!r;if(r){o.x=r[0];o.y=r[1]}}}}}
+function allInter(){const cs=objs.filter(o=>(o.t==='ln'||o.t==='ci')&&!o.dead&&pr(o.id)&&curve(o)),out=[];
+ for(let i=0;i<cs.length;i++)for(let j=i+1;j<cs.length;j++)for(const s of[1,-1]){
+  if(cs[i].t==='ln'&&cs[j].t==='ln'&&s<0)continue;
+  const r=inter(curve(cs[i]),curve(cs[j]),s);if(r)out.push({x:r[0],y:r[1],a:cs[i].id,b:cs[j].id,s})}
+ return out}
+function snap(x,y){const R=12/view.k;let best=null,bd=R;
+ for(const o of objs)if(o.t==='pt'&&o.ok&&ptOk(o)){const d=Math.hypot(o.x-x,o.y-y);if(d<bd){bd=d;best={k:'pt',id:o.id,x:o.x,y:o.y}}}
+ if(best)return best;
+ for(const c of allInter()){const d=Math.hypot(c.x-x,c.y-y);if(d<bd){bd=d;best={k:'in',...c}}}
+ return best||{k:'free',x,y}}
+function commit(sn){
+ if(sn.k==='pt')return sn.id;
+ if(sn.k==='in'){const ex=objs.find(o=>o.t==='pt'&&!o.free&&!o.dead&&o.a===sn.a&&o.b===sn.b&&o.s===sn.s);return ex?ex.id:add({t:'pt',free:false,a:sn.a,b:sn.b,s:sn.s})}
+ return add({t:'pt',free:true,x:sn.x,y:sn.y})}
+function kill(id){const o=P(id);if(o.dead)return;o.dead=true;
+ for(const q of objs)if(!q.dead&&(q.a===id||q.b===id||q.c===id||q.p===id||q.tan===id||q.ci===id||q.tg===id||q.to===id||q.on===id||q.tan2===id||q.e===id||q.d1===id||q.d2===id||(q.cc&&(q.cc[0]===id||q.cc[1]===id))))kill(q.id);recalc()}
+function pos(e){const r=S.getBoundingClientRect();return[view.x+(e.clientX-r.left)/view.k,view.y+(e.clientY-r.top)/view.k]}
+S.addEventListener('pointerdown',e=>{if(e.button>1)return;if(e.button===1||spaceDown){startPan(e);S.setPointerCapture(e.pointerId);e.preventDefault();return}const[x,y]=pos(e);if(edit){commitEdit(x,y,e.shiftKey||tgOn);return}
+ if(tool==='move'){if(e.ctrlKey||e.metaKey){togglePrio(x,y);return}const hp=objs.filter(o=>o.t==='pt'&&o.ok&&!o.dead).find(o=>Math.hypot(o.x-x,o.y-y)<12/view.k),t=hp&&(hp.free||hp.on!==undefined)?hp:null;sel=hp?hp.id:null;if(t){save();drag=t}else if(hp){}else if(!imgDown(x,y))startPan(e);S.setPointerCapture(e.pointerId);return}
+ if(tool==='del'){save();const sn=snap(x,y);if(sn.k==='pt')kill(sn.id);else{const o=objs.find(o=>!o.dead&&(o.t==='ln'||o.t==='ci')&&curve(o)&&dist(curve(o),x,y)<8/view.k);if(o)kill(o.id)}draw();return}
+ save();
+ if(tool==='ci'&&pend.length===1&&(e.shiftKey||tgOn)){const tg=tangentFor(pend[0],x,y);
+  if(tg){const ci=add({t:'ci',c:pend[0],tan:tg.tan,m:tg.m});add({t:'pt',free:false,tp:true,ci:ci,tg:tg.tan});pend=[];ghost=null;draw();return}}
+ if(tool==='ln'&&pend.length===1&&(e.shiftKey||tgOn)){const tg=tangentLineFor(pend[0],x,y);
+  if(tg){const ln=add({t:'ln',a:pend[0],to:tg.to,s:tg.s});add({t:'pt',free:false,tp:true,ci:tg.to,tg:ln});pend=[];ghost=null;draw();return}}
+ if(tool==='tc'){if(tcSel.length<2){const o=objs.find(o=>!o.dead&&o.t==='ci'&&curve(o)&&dist(curve(o),x,y)<12/view.k);if(o&&!tcSel.includes(o.id))tcSel.push(o.id)}
+  else{const g=commonTanFor(tcSel[0],tcSel[1],x,y);if(g){const ln=add({t:'ln',cc:[tcSel[0],tcSel[1]],s:g.s,tt:g.t});add({t:'pt',free:false,tp:true,ci:tcSel[0],tg:ln});add({t:'pt',free:false,tp:true,ci:tcSel[1],tg:ln});tcSel=[];ghost=null}}
+  draw();return}
+ if(tool==='cb'&&pend.length===1&&(e.shiftKey||tgOn)){const tg=edgeTangentFor(pend[0],x,y);
+  if(tg){const ci=add({t:'ci',e:pend[0],...tanFields(tg)});for(const q of tanIds(tg))add({t:'pt',free:false,tp:true,ci:ci,tg:q});pend=[];ghost=null;draw();return}}
+ const id=commit(snap(x,y));
+ if(tool==='pt'){draw();return}
+ pend.push(id);
+ if(pend.length===2){if(pend[0]!==pend[1])add(tool==='ln'?{t:'ln',a:pend[0],b:pend[1]}:tool==='cb'?{t:'ci',d1:pend[0],d2:pend[1]}:{t:'ci',c:pend[0],p:pend[1]});pend=[]}
+ draw()});
+function dist(c,x,y){return c.t==='c'?Math.abs(Math.hypot(x-c.x,y-c.y)-c.r):Math.abs((x-c.x)*c.dy-(y-c.y)*c.dx)/Math.hypot(c.dx,c.dy)}
+let ghost=null,last=[0,0],tgOn=false,view={x:0,y:0,k:1},pan=null,spaceDown=false,hist=[],redo=[],refImg=null,refLock=false,imgDrag=null,tcSel=[],edit=null,sel=null,prio=new Set();
+S.innerHTML='<image id="ri" opacity=".1" preserveAspectRatio="none" style="pointer-events:none"/><g id="g"></g>';
+const G=document.getElementById('g'),RI=document.getElementById('ri');
+function tanLine(a,K,s){const vx=K.x-a.x,vy=K.y-a.y,D=Math.hypot(vx,vy);if(D<1e-12||D<K.r-1e-9)return null;
+ const al=Math.asin(Math.min(1,K.r/D))*s,c=Math.cos(al),sn=Math.sin(al);return{t:'l',x:a.x,y:a.y,dx:vx*c-vy*sn,dy:vx*sn+vy*c}}
+function tangentLineFor(pid,x,y){const a=P(pid);let best=null,bd=30/view.k;
+ for(const o of objs){if(o.dead||!pr(o.id)||o.t!=='ci')continue;const K=curve(o);if(!K)continue;
+  for(const s of[1,-1]){const L=tanLine(a,K,s);if(!L)continue;const d=dist(L,x,y);if(d<bd){bd=d;best={to:o.id,s}}}}
+ return best}
+function setLock(v){refLock=v;const b=document.getElementById('lk');b.textContent=v?'Destravar imagem':'Travar imagem';b.classList.toggle('on',v)}
+function refPt(lx,ly){const a=(refImg.r||0)*Math.PI/180,c=Math.cos(a),s=Math.sin(a);return[refImg.x+refImg.w/2+lx*c-ly*s,refImg.y+refImg.h/2+lx*s+ly*c]}
+function refCorners(){const w=refImg.w/2,h=refImg.h/2;return[[-w,-h],[w,-h],[w,h],[-w,h]].map(p=>refPt(p[0],p[1]))}
+function imgDown(x,y){if(!refImg||refLock)return false;const cx=refImg.x+refImg.w/2,cy=refImg.y+refImg.h/2,a=-(refImg.r||0)*Math.PI/180,c=Math.cos(a),s=Math.sin(a),dx=x-cx,dy=y-cy,lx=dx*c-dy*s,ly=dx*s+dy*c,hr=12/view.k,w=refImg.w/2,h=refImg.h/2;
+ if(Math.hypot(lx,ly+h+30/view.k)<hr){imgDrag={m:'rot'};return true}
+ for(const[sx,sy]of[[-1,-1],[1,-1],[1,1],[-1,1]])if(Math.hypot(lx-sx*w,ly-sy*h)<hr){imgDrag={m:'sc',d0:Math.hypot(dx,dy),w0:refImg.w,h0:refImg.h,cx,cy};return true}
+ if(Math.abs(lx)<=w&&Math.abs(ly)<=h){imgDrag={m:'mv',sx:x,sy:y,x0:refImg.x,y0:refImg.y};return true}
+ return false}
+function imgMove(x,y){const d=imgDrag,r=refImg;
+ if(d.m==='rot'){r.r=Math.atan2(y-(r.y+r.h/2),x-(r.x+r.w/2))*180/Math.PI+90}
+ else if(d.m==='sc'){const f=Math.max(.02,Math.hypot(x-d.cx,y-d.cy)/d.d0);r.w=d.w0*f;r.h=d.h0*f;r.x=d.cx-r.w/2;r.y=d.cy-r.h/2}
+ else{r.x=d.x0+x-d.sx;r.y=d.y0+y-d.sy}}
+function edgeR(A,u,T,sg){let r;
+ if(T.t==='l'){const n=Math.hypot(T.dx,T.dy),nx=-T.dy/n,ny=T.dx/n,sd=(A.x-T.x)*nx+(A.y-T.y)*ny,den=sg-(u[0]*nx+u[1]*ny);if(Math.abs(den)<1e-9)return null;r=sd/den}
+ else{const wx=A.x-T.x,wy=A.y-T.y,den=2*(u[0]*wx+u[1]*wy-sg*T.r);if(Math.abs(den)<1e-9)return null;r=(T.r*T.r-wx*wx-wy*wy)/den}
+ return r>1e-9?r:null}
+function edgeTangentFor(pid,x,y){return tanSolve(P(pid),x,y,new Set())}
+function edgeTangentOld(pid,x,y){const A=P(pid),ang=Math.atan2(y-A.y,x-A.x),u=[Math.cos(ang),Math.sin(ang)],d0=Math.hypot(x-A.x,y-A.y);let best=null,bd=40/view.k;
+ for(const o of objs){if(o.dead||(o.t!=='ln'&&o.t!=='ci'))continue;const T=curve(o);if(!T)continue;
+  for(const sg of[1,-1]){const r=edgeR(A,u,T,sg);if(r!==null&&Math.abs(2*r-d0)<bd){bd=Math.abs(2*r-d0);best={tan:o.id,sg,ang,r}}}}
+ return best}
+function commonTan(A,B,s,t){const dx=B.x-A.x,dy=B.y-A.y,D=Math.hypot(dx,dy);if(D<1e-12)return null;const c=(s*B.r-A.r)/D;if(Math.abs(c)>1+1e-12)return null;
+ const sq=Math.sqrt(Math.max(0,1-c*c)),ux=dx/D,uy=dy/D,nx=c*ux-t*sq*uy,ny=c*uy+t*sq*ux,h=nx*A.x+ny*A.y-A.r;return{t:'l',x:nx*h,y:ny*h,dx:-ny,dy:nx}}
+function commonTanFor(i,j,x,y){const A=curve(P(i)),B=curve(P(j));if(!A||!B)return null;let best=null,bd=1e18;
+ for(const s of[1,-1])for(const t of[1,-1]){const L=commonTan(A,B,s,t);if(!L)continue;const d=dist(L,x,y);if(d<bd){bd=d;best={s,t}}}
+ return best}
+function pccRow(A,T,s){if(T.t==='l'){const n=Math.hypot(T.dx,T.dy),nx=-T.dy/n,ny=T.dx/n;return[nx,ny,-s,nx*T.x+ny*T.y]}
+ return[2*(A.x-T.x),2*(A.y-T.y),-2*s*T.r,T.r*T.r-T.x*T.x-T.y*T.y+A.x*A.x+A.y*A.y]}
+function pccRoots(A,T1,s1,T2,s2){const[a1,b1,c1,d1]=pccRow(A,T1,s1),[a2,b2,c2,d2]=pccRow(A,T2,s2),det=a1*b2-a2*b1;if(Math.abs(det)<1e-9)return[];
+ const p0=(d1*b2-d2*b1)/det,p1=(-c1*b2+c2*b1)/det,q0=(a1*d2-a2*d1)/det,q1=(-a1*c2+a2*c1)/det,ex=p0-A.x,ey=q0-A.y,qa=p1*p1+q1*q1-1,qb=2*(p1*ex+q1*ey),qc=ex*ex+ey*ey;let rs=[];
+ if(Math.abs(qa)<1e-12){if(Math.abs(qb)>1e-12)rs=[-qc/qb]}else{const D=qb*qb-4*qa*qc;if(D>=0){const sq=Math.sqrt(D);rs=[(-qb-sq)/(2*qa),(-qb+sq)/(2*qa)].sort((a,b)=>a-b)}}
+ return rs.map(r=>({x:p0+p1*r,y:q0+q1*r,r}))}
+function pccAt(A,T1,s1,T2,s2,kk){const q=pccRoots(A,T1,s1,T2,s2)[kk];return q&&q.r>1e-9?{t:'c',x:q.x,y:q.y,r:q.r}:null}
+function tanSolve(A,x,y,bad){const ang=Math.atan2(y-A.y,x-A.x),u=[Math.cos(ang),Math.sin(ang)],d0=Math.hypot(x-A.x,y-A.y);let best=null,bs=40/view.k;
+ const cs=[];for(const o of objs){if(o.dead||!pr(o.id)||bad.has(o.id)||(o.t!=='ln'&&o.t!=='ci'))continue;const T=curve(o);if(T)cs.push({id:o.id,T})}
+ for(const c of cs)for(const sg of[1,-1]){const r=edgeR(A,u,c.T,sg);if(r!==null){const sc=Math.abs(2*r-d0);if(sc<bs){bs=sc;best={tan:c.id,sg,ang,r,cx:A.x+u[0]*r,cy:A.y+u[1]*r}}}}
+ for(let i=0;i<cs.length;i++)for(let j=i+1;j<cs.length;j++)for(const s1 of[1,-1])for(const s2 of[1,-1])pccRoots(A,cs[i].T,s1,cs[j].T,s2).forEach((q,kk)=>{if(q.r>1e-9){const sc=.7*Math.abs(Math.hypot(x-q.x,y-q.y)-q.r);if(sc<bs){bs=sc;best={tan:cs[i].id,sg:s1,tan2:cs[j].id,sg2:s2,kk,ang,r:q.r,cx:q.x,cy:q.y}}}});
+ return best}
+function tanFields(tg){return tg.tan2!==undefined?{ang:tg.ang,tan:tg.tan,sg:tg.sg,tan2:tg.tan2,sg2:tg.sg2,kk:tg.kk}:{ang:tg.ang,tan:tg.tan,sg:tg.sg}}
+function tanIds(tg){return tg.tan2!==undefined?[tg.tan,tg.tan2]:[tg.tan]}
+function refsOf(q){return[q.a,q.b,q.c,q.p,q.tan,q.tan2,q.ci,q.tg,q.to,q.e,q.d1,q.d2,q.on].concat(q.cc||[]).filter(v=>v!==undefined)}
+function descOf(id){const s=new Set([id]);let ch=true;while(ch){ch=false;for(const q of objs)if(!q.dead&&!s.has(q.id)&&refsOf(q).some(v=>s.has(v))){s.add(q.id);ch=true}}return s}
+function safeSnap(x,y,bad){const sn=snap(x,y);if((sn.k==='pt'&&bad.has(sn.id))||(sn.k==='in'&&(bad.has(sn.a)||bad.has(sn.b))))return{k:'free',x,y};return sn}
+function startEdit(o,x,y){const C=curve(o),d=Math.hypot(x-C.x,y-C.y)||1,px=C.x+C.r*(x-C.x)/d,py=C.y+C.r*(y-C.y)/d,bad=descOf(o.id),sn=safeSnap(px,py,bad);
+ edit={id:o.id,sn,ax:sn.x,ay:sn.y,bad};pend=[];ghost=null;hover=null;draw()}
+function commitEdit(x,y,sh){const E=edit,A={x:E.ax,y:E.ay},tg=sh&&tanSolve(A,x,y,E.bad);let fields,sb=null;
+ if(!tg){sb=safeSnap(x,y,E.bad);if(Math.hypot(sb.x-A.x,sb.y-A.y)<1e-6)return}
+ save();const aid=commit(E.sn);
+ if(tg)fields={e:aid,...tanFields(tg)};else fields={d1:aid,d2:commit(sb)};
+ const o=objs[E.id];for(const k of['c','p','tan','m','e','ang','sg','tan2','sg2','kk','d1','d2'])delete o[k];Object.assign(o,fields);
+ for(const q of objs)if(q.tp&&q.ci===E.id&&!q.dead)kill(q.id);
+ if(tg)for(const t of tanIds(tg))add({t:'pt',free:false,tp:true,ci:E.id,tg:t});
+ edit=null;ghost=null;recalc();draw()}
+S.addEventListener('dblclick',e=>{if(tool!=='move')return;const[x,y]=pos(e);const o=objs.find(o=>!o.dead&&o.t==='ci'&&curve(o)&&dist(curve(o),x,y)<10/view.k);if(o)startEdit(o,x,y)});
+function moveDrag(x,y,sh){const d=drag;let best=null,bd=15/view.k;
+ if(sh){const bad=descOf(d.id);for(const o of objs){if(o.dead||!pr(o.id)||bad.has(o.id)||(o.t!=='ln'&&o.t!=='ci'))continue;const T=curve(o);if(!T)continue;const dd=dist(T,x,y);if(dd<bd){bd=dd;best={o,T}}}}
+ if(best){const T=best.T;d.free=false;d.on=best.o.id;d.u=T.t==='c'?Math.atan2(y-T.y,x-T.x):((x-T.x)*T.dx+(y-T.y)*T.dy)/(T.dx*T.dx+T.dy*T.dy)}
+ else{d.free=true;delete d.on;d.x=x;d.y=y}
+ recalc()}
+function pr(id){return !prio.size||prio.has(id)}
+function ptOk(o){if(!prio.size||prio.has(o.id))return true;const r=refsOf(o);if(r.length&&r.every(i=>prio.has(i)))return true;return objs.some(q=>!q.dead&&prio.has(q.id)&&refsOf(q).includes(o.id))}
+function togglePrio(x,y){let id=null;const p=objs.find(o=>o.t==='pt'&&o.ok&&!o.dead&&Math.hypot(o.x-x,o.y-y)<7/view.k);
+ if(p)id=p.id;else{const c=objs.find(o=>!o.dead&&(o.t==='ln'||o.t==='ci')&&curve(o)&&dist(curve(o),x,y)<8/view.k);if(c)id=c.id}
+ if(id!==null){if(prio.has(id))prio.delete(id);else prio.add(id)}draw()}
+S.addEventListener('contextmenu',e=>e.preventDefault());
+function startPan(e){pan={sx:e.clientX,sy:e.clientY,vx:view.x,vy:view.y}}
+function save(){const s=JSON.stringify(objs);if(hist[hist.length-1]!==s){hist.push(s);if(hist.length>200)hist.shift();redo=[]}}
+function undo(){if(!hist.length)return;sel=null;redo.push(JSON.stringify(objs));objs=JSON.parse(hist.pop());pend=[];ghost=null;recalc();draw()}
+function redoF(){if(!redo.length)return;sel=null;hist.push(JSON.stringify(objs));objs=JSON.parse(redo.pop());pend=[];ghost=null;recalc();draw()}
+function zoomBy(f){const cx=view.x+W/view.k/2,cy=view.y+H/view.k/2;view.k=Math.min(200,Math.max(.05,view.k*f));view.x=cx-W/view.k/2;view.y=cy-H/view.k/2;draw()}
+S.addEventListener('wheel',e=>{e.preventDefault();const r=S.getBoundingClientRect(),sx=e.clientX-r.left,sy=e.clientY-r.top,wx=view.x+sx/view.k,wy=view.y+sy/view.k;view.k=Math.min(200,Math.max(.05,view.k*Math.exp(-e.deltaY*.0015)));view.x=wx-sx/view.k;view.y=wy-sy/view.k;draw()},{passive:false});
+addEventListener('keydown',e=>{if(e.code==='Space'&&!spaceDown){spaceDown=true;S.style.cursor='grab';e.preventDefault()}
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redoF():undo()}
+ if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redoF()}
+ if((e.key==='Delete'||e.key==='Backspace')&&sel!==null&&!edit&&P(sel)&&!P(sel).dead){e.preventDefault();save();kill(sel);sel=null;draw()}
+ if(!e.ctrlKey&&!e.metaKey&&!e.altKey){const k=e.key.toLowerCase(),m={v:'move',p:'pt',l:'ln',c:'ci',b:'cb',t:'tc',x:'del'}[k];
+  if(m)document.querySelector('[data-t='+m+']').click();else if(k==='s')document.getElementById('tg').click();else if(k==='0')document.getElementById('z1').click();else if(k==='+'||k==='=')zoomBy(1.4);else if(k==='-')zoomBy(1/1.4)}
+ if(e.key==='Escape'){if(!edit&&!pend.length&&!tcSel.length&&sel===null)prio.clear();sel=null;edit=null;pend=[];tcSel=[];ghost=null;draw()}});
+addEventListener('keyup',e=>{if(e.code==='Space'){spaceDown=false;S.style.cursor=''}});
+addEventListener('paste',e=>{for(const it of e.clipboardData.items)if(it.type.startsWith('image/')){const rd=new FileReader();rd.onload=()=>{const im=new Image();im.onload=()=>{const k=Math.min(1,(W/view.k*.8)/im.width,(H/view.k*.8)/im.height),w=im.width*k,h=im.height*k;refImg={x:view.x+(W/view.k-w)/2,y:view.y+(H/view.k-h)/2,w,h,r:0};setLock(false);document.querySelector('[data-t=move]').click();RI.setAttribute('href',rd.result);draw()};im.src=rd.result};rd.readAsDataURL(it.getAsFile());e.preventDefault();return}});
+function tanR(T,x,y,m){if(T.t==='l'){const r=Math.abs((x-T.x)*T.dy-(y-T.y)*T.dx)/Math.hypot(T.dx,T.dy);return r>1e-9?r:null}
+ const D=Math.hypot(x-T.x,y-T.y);if(D<1e-6)return null;const r=m===0?D-T.r:m===1?T.r-D:D+T.r;return r>1e-9?r:null}
+function tangentFor(cid,x,y){const c=P(cid),d0=Math.hypot(x-c.x,y-c.y);let best=null,bd=40/view.k;
+ for(const o of objs){if(o.dead||!pr(o.id)||o.t==='pt')continue;const T=curve(o);if(!T)continue;
+  for(const m of(T.t==='l'?[0]:[0,1,2])){const r=tanR(T,c.x,c.y,m);if(r!==null&&Math.abs(r-d0)<bd){bd=Math.abs(r-d0);best={tan:o.id,m,r}}}}
+ return best}
+function mv(x,y,sh){last=[x,y];
+ if(edit){hover=safeSnap(x,y,edit.bad);const A={x:edit.ax,y:edit.ay},tg=(sh||tgOn)&&tanSolve(A,x,y,edit.bad);
+  if(tg){ghost={x:tg.cx,y:tg.cy,r:tg.r,tan:tg.tan,tan2:tg.tan2};hover=null}else ghost={x:(A.x+hover.x)/2,y:(A.y+hover.y)/2,r:Math.hypot(hover.x-A.x,hover.y-A.y)/2};draw();return}
+ if(drag){moveDrag(x,y,sh||tgOn)}
+ else if(tool!=='move'&&tool!=='del'){hover=snap(x,y);ghost=null;
+  if(tool==='tc'&&tcSel.length===2){const g=commonTanFor(tcSel[0],tcSel[1],x,y);if(g)ghost={ln:commonTan(curve(P(tcSel[0])),curve(P(tcSel[1])),g.s,g.t)}}
+  if(tool==='ln'&&pend.length===1&&(sh||tgOn)){const tg=tangentLineFor(pend[0],x,y);if(tg){ghost={ln:tanLine(P(pend[0]),curve(P(tg.to)),tg.s),tan:tg.to};hover=null}}
+  if(tool==='cb'&&pend.length===1){const A=P(pend[0]),tg=(sh||tgOn)&&edgeTangentFor(pend[0],x,y);
+   if(tg){ghost={x:tg.cx,y:tg.cy,r:tg.r,tan:tg.tan,tan2:tg.tan2};hover=null}
+   else ghost={x:(A.x+hover.x)/2,y:(A.y+hover.y)/2,r:Math.hypot(hover.x-A.x,hover.y-A.y)/2}}
+  if(tool==='ci'&&pend.length===1){const c=P(pend[0]),tg=(sh||tgOn)&&tangentFor(pend[0],x,y);
+   if(tg){ghost={x:c.x,y:c.y,r:tg.r,tan:tg.tan};hover=null}else ghost={x:c.x,y:c.y,r:Math.hypot(hover.x-c.x,hover.y-c.y)}}}
+ else hover=null;draw()}
+S.addEventListener('pointermove',e=>{if(imgDrag){const[ix,iy]=pos(e);imgMove(ix,iy);draw();return}if(pan){view.x=pan.vx-(e.clientX-pan.sx)/view.k;view.y=pan.vy-(e.clientY-pan.sy)/view.k;draw();return}const[x,y]=pos(e);mv(x,y,e.shiftKey)});
+addEventListener('keydown',e=>{if(e.key==='Shift')mv(last[0],last[1],true)});
+addEventListener('keyup',e=>{if(e.key==='Shift')mv(last[0],last[1],false)});
+S.addEventListener('pointerup',()=>{drag=null;pan=null;imgDrag=null});
+function line(c){const L=1e6,n=Math.hypot(c.dx,c.dy),ux=c.dx/n,uy=c.dy/n;return[c.x-ux*L,c.y-uy*L,c.x+ux*L,c.y+uy*L]}
+function build(ui){let h='';
+ for(const o of objs){if(o.dead||o.t==='pt')continue;const c=curve(o);if(!c)continue;
+  if(c.t==='c')h+=`<circle cx="${c.x}" cy="${c.y}" r="${c.r}" fill="none" stroke="${ui?'var(--ln)':'#000'}" stroke-width="1.5"/>`;
+  else{const l=line(c);h+=`<line x1="${l[0]}" y1="${l[1]}" x2="${l[2]}" y2="${l[3]}" stroke="${ui?'var(--ln)':'#000'}" stroke-width="1.5"/>`}}
+ if(ui){for(const o of objs)if(o.t==='pt'&&o.ok)h+=`<circle cx="${o.x}" cy="${o.y}" r="${(o.free?4.5:3.5)/view.k}" fill="${(o.free||o.on!==undefined)?'var(--ac)':'var(--pt)'}"/>`;
+  for(const i of pend){const o=P(i);h+=`<circle cx="${o.x}" cy="${o.y}" r="${9/view.k}" fill="none" stroke="var(--ac)" stroke-width="2"/>`}
+  if(tool==='move'&&refImg&&!refLock){const c=refCorners(),tm=refPt(0,-refImg.h/2),rp=refPt(0,-refImg.h/2-30/view.k);
+   h+=`<polygon points="${c.map(p=>p.join(',')).join(' ')}" fill="none" stroke="var(--ac)" stroke-width="1" stroke-dasharray="4 3"/><line x1="${tm[0]}" y1="${tm[1]}" x2="${rp[0]}" y2="${rp[1]}" stroke="var(--ac)" stroke-width="1"/><circle cx="${rp[0]}" cy="${rp[1]}" r="${6/view.k}" fill="var(--ac)"/>`;
+   for(const p of c)h+=`<rect x="${p[0]-5/view.k}" y="${p[1]-5/view.k}" width="${10/view.k}" height="${10/view.k}" fill="#fff" stroke="var(--ac)" stroke-width="1.5"/>`}
+  if(edit){const T=curve(P(edit.id));if(T)h+=`<circle cx="${T.x}" cy="${T.y}" r="${T.r}" fill="none" stroke="var(--pt)" stroke-width="3" opacity=".35"/><circle cx="${edit.ax}" cy="${edit.ay}" r="${7/view.k}" fill="none" stroke="var(--pt)" stroke-width="2"/>`}
+  if(sel!==null&&P(sel)&&P(sel).ok&&!P(sel).dead)h+=`<circle cx="${P(sel).x}" cy="${P(sel).y}" r="${9/view.k}" fill="none" stroke="var(--pt)" stroke-width="2"/>`;
+  for(const i of prio){const o=objs[i];if(!o||o.dead)continue;if(o.t==='pt'){if(o.ok)h+=`<circle cx="${o.x}" cy="${o.y}" r="${8/view.k}" fill="none" stroke="#f59e0b" stroke-width="2.5"/>`}else{const T=curve(o);if(T){if(T.t==='c')h+=`<circle cx="${T.x}" cy="${T.y}" r="${T.r}" fill="none" stroke="#f59e0b" stroke-width="4" opacity=".6"/>`;else{const l=line(T);h+=`<line x1="${l[0]}" y1="${l[1]}" x2="${l[2]}" y2="${l[3]}" stroke="#f59e0b" stroke-width="4" opacity=".6"/>`}}}}
+  for(const i of tcSel){const T=curve(P(i));if(T)h+=`<circle cx="${T.x}" cy="${T.y}" r="${T.r}" fill="none" stroke="var(--ac)" stroke-width="4" opacity=".4"/>`}
+  const g=(pend.length===1||tool==='tc'||edit)?ghost:null;
+  if(g){if(g.ln){const l=line(g.ln);h+=`<line x1="${l[0]}" y1="${l[1]}" x2="${l[2]}" y2="${l[3]}" stroke="var(--ac)" stroke-width="1.5" stroke-dasharray="5 4"/>`}else h+=`<circle cx="${g.x}" cy="${g.y}" r="${g.r}" fill="none" stroke="var(--ac)" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+   for(const gid of[g.tan,g.tan2])if(gid!==undefined){const T=curve(P(gid));if(T){if(T.t==='c')h+=`<circle cx="${T.x}" cy="${T.y}" r="${T.r}" fill="none" stroke="var(--ac)" stroke-width="4" opacity=".4"/>`;else{const l=line(T);h+=`<line x1="${l[0]}" y1="${l[1]}" x2="${l[2]}" y2="${l[3]}" stroke="var(--ac)" stroke-width="4" opacity=".4"/>`}}}}
+  if(hover)h+=`<circle cx="${hover.x}" cy="${hover.y}" r="${8/view.k}" fill="none" stroke="${hover.k==='free'?'var(--mut)':'var(--pt)'}" stroke-width="2"/>`}
+ return h}
+function draw(){S.setAttribute('viewBox',`${view.x} ${view.y} ${W/view.k} ${H/view.k}`);
+ if(refImg){RI.style.display='';RI.setAttribute('x',refImg.x);RI.setAttribute('y',refImg.y);RI.setAttribute('width',refImg.w);RI.setAttribute('height',refImg.h);RI.setAttribute('transform',`rotate(${refImg.r||0} ${refImg.x+refImg.w/2} ${refImg.y+refImg.h/2})`)}else RI.style.display='none';
+ G.innerHTML=build(true);
+ const n=objs.filter(o=>!o.dead&&o.t==='pt'&&!o.free&&o.ok).length;
+ ST.textContent=msgs[tool]+'  ·  interseções calculadas: '+n+(prio.size?'  ·  prioridade: '+prio.size+' objeto(s) (Esc limpa)':'')+'  ·  zoom '+Math.round(view.k*100)+'%  ·  Ctrl+Z desfaz · Ctrl+V cola imagem de referência · Espaço+arrastar move a vista'}
+function resize(){const r=S.getBoundingClientRect();W=r.width;H=r.height;draw()}
+addEventListener('resize',resize);
+document.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{tool=b.dataset.t;edit=null;pend=[];tcSel=[];ghost=null;hover=null;document.querySelectorAll('[data-t]').forEach(x=>x.classList.toggle('on',x===b));draw()});
+document.getElementById('clr').onclick=()=>{save();objs=[];pend=[];prio.clear();draw()};
+function clipLine(c,x0,y0,x1,y1){let t0=-1e18,t1=1e18;
+ for(const[p,q,lo,hi]of[[c.x,c.dx,x0,x1],[c.y,c.dy,y0,y1]]){if(Math.abs(q)<1e-12){if(p<lo||p>hi)return null}else{let a=(lo-p)/q,b=(hi-p)/q;if(a>b)[a,b]=[b,a];t0=Math.max(t0,a);t1=Math.min(t1,b)}}
+ if(t0>t1)return null;return[c.x+t0*c.dx,c.y+t0*c.dy,c.x+t1*c.dx,c.y+t1*c.dy]}
+function makeSVG(bg){let x0=1e18,y0=1e18,x1=-1e18,y1=-1e18;const up=(x,y)=>{x0=Math.min(x0,x);y0=Math.min(y0,y);x1=Math.max(x1,x);y1=Math.max(y1,y)};
+ const cs=[],ls=[];
+ for(const o of objs){if(o.dead)continue;if(o.t==='pt'){if(o.ok)up(o.x,o.y)}else{const c=curve(o);if(!c)continue;if(c.t==='c'){up(c.x-c.r,c.y-c.r);up(c.x+c.r,c.y+c.r);cs.push(c)}else ls.push(c)}}
+ if(x0>x1){x0=view.x;y0=view.y;x1=view.x+W/view.k;y1=view.y+H/view.k}
+ const m=Math.max(20,.05*Math.max(x1-x0,y1-y0));x0-=m;y0-=m;x1+=m;y1+=m;
+ const f=n=>+n.toFixed(3),w=x1-x0,h=y1-y0;
+ const circ='<g id="circulos" fill="none" stroke="#000" stroke-width="1.5">'+cs.map(c=>`<circle cx="${f(c.x)}" cy="${f(c.y)}" r="${f(c.r)}"/>`).join('')+'</g>';
+ const ret='<g id="retas" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round">'+ls.map(c=>{const s=clipLine(c,x0,y0,x1,y1);return s?`<line x1="${f(s[0])}" y1="${f(s[1])}" x2="${f(s[2])}" y2="${f(s[3])}"/>`:''}).join('')+'</g>';
+ const bgr=bg?`<rect x="${f(x0)}" y="${f(y0)}" width="${f(w)}" height="${f(h)}" fill="#fff"/>`:'';
+ return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(x0)} ${f(y0)} ${f(w)} ${f(h)}" width="${f(w)}" height="${f(h)}">${bgr}${circ}${ret}</svg>`}
+function dlSVG(bg){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([makeSVG(bg)],{type:'image/svg+xml'}));a.download='construcao.svg';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)}
+document.getElementById('exp').onclick=()=>dlSVG(true);document.getElementById('exs').onclick=()=>dlSVG(false);
+const oldExp=()=>{const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="${view.x} ${view.y} ${W/view.k} ${H/view.k}" width="${W}" height="${H}"><rect x="${view.x}" y="${view.y}" width="${W/view.k}" height="${H/view.k}" fill="#fff"/>${build(false).replaceAll('stroke-width="1.5"','stroke-width="'+1.5/view.k+'"')}</svg>`;
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([svg],{type:'image/svg+xml'}));a.download='construcao.svg';a.click()};
+function demo(){save();objs=[];pend=[];prio.clear();const cx=view.x+W/view.k/2,cy=view.y+H/view.k/2,r=Math.min(W,H)/view.k/7;
+ const p0=add({t:'pt',free:true,x:cx,y:cy}),p1=add({t:'pt',free:true,x:cx+r,y:cy});
+ const c0=add({t:'ci',c:p0,p:p1}),c1=add({t:'ci',c:p1,p:p0});
+ const a=add({t:'pt',free:false,a:c0,b:c1,s:1}),b=add({t:'pt',free:false,a:c0,b:c1,s:-1});
+ const c2=add({t:'ci',c:a,p:p0}),c3=add({t:'ci',c:b,p:p0});
+ add({t:'ln',a:a,b:b});
+ const l=add({t:'ln',a:p0,b:p1});
+ for(const c of[c2,c3])for(const s of[1,-1])add({t:'pt',free:false,a:c,b:l,s});
+ const q=add({t:'pt',free:true,x:cx-r*2.6,y:cy-r*1.2}),tc=add({t:'ci',c:q,tan:c0,m:0});add({t:'pt',free:false,tp:true,ci:tc,tg:c0});
+ draw()}
+document.getElementById('ex').onclick=demo;
+document.getElementById('tg').onclick=e=>{tgOn=!tgOn;e.currentTarget.classList.toggle('on',tgOn)};
+document.getElementById('un').onclick=undo;document.getElementById('re').onclick=redoF;
+document.getElementById('zi').onclick=()=>zoomBy(1.4);document.getElementById('zo').onclick=()=>zoomBy(1/1.4);
+document.getElementById('z1').onclick=()=>{view={x:0,y:0,k:1};draw()};
+document.getElementById('rx').onclick=()=>{refImg=null;RI.removeAttribute('href');draw()};
+document.getElementById('lk').onclick=()=>{setLock(!refLock);draw()};
+document.getElementById('dl').onclick=()=>{if(sel!==null&&P(sel)&&!P(sel).dead){save();kill(sel);sel=null;draw()}};
+document.getElementById('pc').onclick=()=>{prio.clear();draw()};
+resize();
+</script></body></html>
