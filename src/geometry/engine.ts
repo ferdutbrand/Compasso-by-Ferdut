@@ -1,23 +1,31 @@
 import type {
+  AlignMode,
   BuiltShape,
   CircleCurve,
   CircleObj,
   CopiedSubgraph,
   Curve,
+  DistributeAxis,
   GeomObj,
   GuideLine,
   IntersectionPoint,
   LineCurve,
   LineObj,
+  MirrorAxis,
   MultiTanSolution,
   Phase,
   PointObj,
+  PolyCurve,
+  PolyObj,
+  SmartGuide,
   SnapResult,
+  SvgExportLayers,
   TanSolution,
   TanTargetSel,
   TangencyCandidate,
   ViewState,
 } from './types';
+import { snapToGrid, type GridConfig } from './grid';
 
 export const DEFAULT_SNAP_PX = 10;
 export const DEFAULT_SVG_OVERLAP_PX = 0.05;
@@ -32,6 +40,7 @@ export function cloneObjs(objs: GeomObj[]): GeomObj[] {
       out[i] = {
         ...o,
         tanSet: [...o.tanSet],
+        tanEdges: o.tanEdges ? [...o.tanEdges] : undefined,
         tanSigns: o.tanSigns ? [...o.tanSigns] : undefined,
         tanRef: o.tanRef ? { ...o.tanRef } : undefined,
       };
@@ -53,6 +62,8 @@ export function refsOf(q: GeomObj): number[] {
   } else if (q.t === 'ln') {
     raw.push(q.a, q.b, q.to);
     if (q.cc) raw.push(q.cc[0], q.cc[1]);
+  } else if (q.t === 'pg') {
+    raw.push(q.c, q.p);
   } else {
     raw.push(q.c, q.p, q.tan, q.tan2, q.e, q.d1, q.d2);
     if (q.tanSet) raw.push(...q.tanSet);
@@ -114,6 +125,7 @@ export function commonTan(A: CircleCurve, B: CircleCurve, s: number, t: number):
 }
 
 export function edgeR(A: { x: number; y: number }, u: [number, number], T: Curve, sg: number): number | null {
+  if (T.t === 'p') return null;
   let r: number;
   if (T.t === 'l') {
     const n = Math.hypot(T.dx, T.dy);
@@ -141,6 +153,7 @@ function pccRow(A: { x: number; y: number }, T: Curve, s: number): [number, numb
     const ny = T.dx / n;
     return [nx, ny, -s, nx * T.x + ny * T.y];
   }
+  if (T.t !== 'c') return [0, 0, 0, 0];
   return [
     2 * (A.x - T.x),
     2 * (A.y - T.y),
@@ -156,6 +169,7 @@ export function pccRoots(
   T2: Curve,
   s2: number
 ): Array<{ x: number; y: number; r: number }> {
+  if (T1.t === 'p' || T2.t === 'p') return [];
   const [a1, b1, c1, d1] = pccRow(A, T1, s1);
   const [a2, b2, c2, d2] = pccRow(A, T2, s2);
   const det = a1 * b2 - a2 * b1;
@@ -195,6 +209,7 @@ export function pccAt(
 }
 
 export function tanR(T: Curve, x: number, y: number, m: number): number | null {
+  if (T.t === 'p') return null;
   if (T.t === 'l') {
     const n = Math.hypot(T.dx, T.dy);
     if (n < 1e-12) return null;
@@ -205,6 +220,24 @@ export function tanR(T: Curve, x: number, y: number, m: number): number | null {
   if (D < 1e-6) return null;
   const r = m === 0 ? D - T.r : m === 1 ? T.r - D : D + T.r;
   return r > 1e-9 ? r : null;
+}
+
+function resolveCurveForTan(
+  id: number | undefined,
+  edgeIdx: number | undefined,
+  refPt: { x: number; y: number } | undefined,
+  getCurve: (id: number | undefined) => Curve | null
+): Curve | null {
+  const cv = getCurve(id);
+  if (!cv) return null;
+  if (cv.t !== 'p') return cv;
+  if (edgeIdx !== undefined && edgeIdx >= 0) {
+    return polyEdgeLine(cv, edgeIdx);
+  }
+  if (refPt) {
+    return nearestPolyEdge(cv, refPt.x, refPt.y)?.line ?? polyEdgeLine(cv, 0);
+  }
+  return polyEdgeLine(cv, 0);
 }
 
 function curveWith(
@@ -241,10 +274,11 @@ function curveWith(
     }
     if (o.e !== undefined) {
       const A = getObj(objs, o.e);
-      const T = getCurve(o.tan);
-      if (!A || A.t !== 'pt' || !A.ok || !T) return null;
+      if (!A || A.t !== 'pt' || !A.ok) return null;
+      const T = resolveCurveForTan(o.tan, o.tanEdge, A, getCurve);
+      if (!T) return null;
       if (o.tan2 !== undefined) {
-        const T2 = getCurve(o.tan2);
+        const T2 = resolveCurveForTan(o.tan2, o.tan2Edge, A, getCurve);
         return T2 ? pccAt(A, T, o.sg ?? 1, T2, o.sg2 ?? 1, o.kk ?? 0) : null;
       }
       const ang = o.ang ?? 0;
@@ -262,7 +296,7 @@ function curveWith(
     const c = getObj(objs, o.c);
     if (!c || c.t !== 'pt' || !c.ok) return null;
     if (o.tan !== undefined) {
-      const T = getCurve(o.tan);
+      const T = resolveCurveForTan(o.tan, o.tanEdge, c, getCurve);
       if (!T) return null;
       const r = tanR(T, c.x, c.y, o.m ?? 0);
       return r === null ? null : { t: 'c', x: c.x, y: c.y, r };
@@ -271,6 +305,23 @@ function curveWith(
     if (!p || p.t !== 'pt' || !p.ok) return null;
     const r = Math.hypot(p.x - c.x, p.y - c.y);
     return r < 1e-9 ? null : { t: 'c', x: c.x, y: c.y, r };
+  }
+
+  if (o.t === 'pg') {
+    const c = getObj(objs, o.c);
+    const p = getObj(objs, o.p);
+    if (!c || c.t !== 'pt' || !c.ok || !p || p.t !== 'pt' || !p.ok) return null;
+    const r = Math.hypot(p.x - c.x, p.y - c.y);
+    if (r < 1e-9) return null;
+    const sides = Math.max(3, Math.round(o.sides));
+    const rot = Math.atan2(p.y - c.y, p.x - c.x);
+    const verts: Array<{ x: number; y: number }> = [];
+    for (let k = 0; k < sides; k++) {
+      const a = rot + (k * Math.PI * 2) / sides;
+      verts.push({ x: c.x + r * Math.cos(a), y: c.y + r * Math.sin(a) });
+    }
+    const side = 2 * r * Math.sin(Math.PI / sides);
+    return { t: 'p', cx: c.x, cy: c.y, r, rot, sides, side, verts };
   }
 
   return null;
@@ -313,8 +364,157 @@ export function curve(
   return curveWith(objs, o, (id) => curve(objs, getObj(objs, id)));
 }
 
+export function polyEdges(P: PolyCurve): Array<{ x1: number; y1: number; x2: number; y2: number }> {
+  const out: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+  const n = P.verts.length;
+  for (let i = 0; i < n; i++) {
+    const a = P.verts[i];
+    const b = P.verts[(i + 1) % n];
+    out.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+  }
+  return out;
+}
+
+export function polyEdgeLine(P: PolyCurve, edgeIdx: number): LineCurve | null {
+  const n = P.verts.length;
+  if (n < 3) return null;
+  const idx = ((edgeIdx % n) + n) % n;
+  const a = P.verts[idx];
+  const b = P.verts[(idx + 1) % n];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (Math.hypot(dx, dy) < 1e-9) return null;
+  return { t: 'l', x: a.x, y: a.y, dx, dy };
+}
+
+export function nearestPolyEdge(
+  P: PolyCurve,
+  px: number,
+  py: number
+): { edge: number; line: LineCurve; segDist: number; lineDist: number; foot: { x: number; y: number } } | null {
+  const n = P.verts.length;
+  if (n < 3) return null;
+  let best: { edge: number; line: LineCurve; segDist: number; lineDist: number; foot: { x: number; y: number } } | null = null;
+  for (let i = 0; i < n; i++) {
+    const a = P.verts[i];
+    const b = P.verts[(i + 1) % n];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    if (len2 < 1e-9) continue;
+    const tRaw = ((px - a.x) * dx + (py - a.y) * dy) / len2;
+    const tClamped = Math.min(1, Math.max(0, tRaw));
+    const segDist = Math.hypot(px - (a.x + tClamped * dx), py - (a.y + tClamped * dy));
+    const footX = a.x + tRaw * dx;
+    const footY = a.y + tRaw * dy;
+    const lineDist = Math.hypot(px - footX, py - footY);
+    if (!best || segDist < best.segDist) {
+      best = {
+        edge: i,
+        line: { t: 'l', x: a.x, y: a.y, dx, dy },
+        segDist,
+        lineDist,
+        foot: { x: footX, y: footY },
+      };
+    }
+  }
+  return best;
+}
+
+function segLineInters(x1: number, y1: number, x2: number, y2: number, L: LineCurve): Array<[number, number]> {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const d = dx * L.dy - dy * L.dx;
+  if (Math.abs(d) < 1e-12) return [];
+  const t = ((L.x - x1) * L.dy - (L.y - y1) * L.dx) / d;
+  if (t < -1e-7 || t > 1 + 1e-7) return [];
+  const tc = Math.min(1, Math.max(0, t));
+  return [[x1 + tc * dx, y1 + tc * dy]];
+}
+
+function segCircleInters(x1: number, y1: number, x2: number, y2: number, C: CircleCurve): Array<[number, number]> {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const fx = x1 - C.x;
+  const fy = y1 - C.y;
+  const a = dx * dx + dy * dy;
+  if (a < 1e-12) return [];
+  const b = 2 * (fx * dx + fy * dy);
+  const c = fx * fx + fy * fy - C.r * C.r;
+  const D = b * b - 4 * a * c;
+  if (D < -1e-9 * a) return [];
+  const sq = Math.sqrt(Math.max(0, D));
+  const out: Array<[number, number]> = [];
+  for (const s of sq < 1e-9 ? [1] : [-1, 1]) {
+    const t = (-b + s * sq) / (2 * a);
+    if (t >= -1e-7 && t <= 1 + 1e-7) {
+      const tc = Math.min(1, Math.max(0, t));
+      out.push([x1 + tc * dx, y1 + tc * dy]);
+    }
+  }
+  return out;
+}
+
+function segSegInters(
+  ax1: number,
+  ay1: number,
+  ax2: number,
+  ay2: number,
+  bx1: number,
+  by1: number,
+  bx2: number,
+  by2: number
+): Array<[number, number]> {
+  const adx = ax2 - ax1;
+  const ady = ay2 - ay1;
+  const bdx = bx2 - bx1;
+  const bdy = by2 - by1;
+  const den = adx * bdy - ady * bdx;
+  if (Math.abs(den) < 1e-12) return [];
+  const t = ((bx1 - ax1) * bdy - (by1 - ay1) * bdx) / den;
+  const u = ((bx1 - ax1) * ady - (by1 - ay1) * adx) / den;
+  if (t < -1e-7 || t > 1 + 1e-7 || u < -1e-7 || u > 1 + 1e-7) return [];
+  const tc = Math.min(1, Math.max(0, t));
+  return [[ax1 + tc * adx, ay1 + tc * ady]];
+}
+
+export function allCurveInters(A: Curve, B: Curve): Array<[number, number]> {
+  const raw: Array<[number, number]> = [];
+  if (A.t === 'p' && B.t === 'p') {
+    const ea = polyEdges(A);
+    const eb = polyEdges(B);
+    for (const a of ea) {
+      for (const b of eb) {
+        raw.push(...segSegInters(a.x1, a.y1, a.x2, a.y2, b.x1, b.y1, b.x2, b.y2));
+      }
+    }
+  } else if (A.t === 'p' || B.t === 'p') {
+    const P = A.t === 'p' ? A : (B as PolyCurve);
+    const other = A.t === 'p' ? B : A;
+    for (const e of polyEdges(P)) {
+      if (other.t === 'l') {
+        raw.push(...segLineInters(e.x1, e.y1, e.x2, e.y2, other));
+      } else if (other.t === 'c') {
+        raw.push(...segCircleInters(e.x1, e.y1, e.x2, e.y2, other));
+      }
+    }
+  }
+  const uniq: Array<[number, number]> = [];
+  for (const pt of raw) {
+    if (!uniq.some((q) => Math.hypot(q[0] - pt[0], q[1] - pt[1]) < 1e-5)) {
+      uniq.push(pt);
+    }
+  }
+  return uniq;
+}
+
 export function inter(A: Curve | null, B: Curve | null, s: number): [number, number] | null {
   if (!A || !B) return null;
+  if (A.t === 'p' || B.t === 'p') {
+    if (s < 0) return null;
+    const pts = allCurveInters(A, B);
+    return pts[s] ?? null;
+  }
   if (A.t === 'c' && B.t === 'l') {
     const tmp = A;
     A = B;
@@ -369,6 +569,15 @@ export function recalc(objs: GeomObj[]): void {
             if (T.t === 'c') {
               o.x = T.x + T.r * Math.cos(u);
               o.y = T.y + T.r * Math.sin(u);
+            } else if (T.t === 'p') {
+              const n = T.verts.length;
+              const clamped = ((u % n) + n) % n;
+              const idx = Math.floor(clamped) % n;
+              const t = clamped - Math.floor(clamped);
+              const v0 = T.verts[idx];
+              const v1 = T.verts[(idx + 1) % n];
+              o.x = v0.x + t * (v1.x - v0.x);
+              o.y = v0.y + t * (v1.y - v0.y);
             } else {
               o.x = T.x + u * T.dx;
               o.y = T.y + u * T.dy;
@@ -390,7 +599,7 @@ export function recalc(objs: GeomObj[]): void {
                 o.x = T.x + t * T.dx;
                 o.y = T.y + t * T.dy;
               }
-            } else {
+            } else if (T.t === 'c') {
               const D = Math.hypot(C.x - T.x, C.y - T.y);
               if (D < 1e-9) {
                 o.ok = false;
@@ -402,6 +611,32 @@ export function recalc(objs: GeomObj[]): void {
                 o.x = T.x + (k * T.r * (C.x - T.x)) / D;
                 o.y = T.y + (k * T.r * (C.y - T.y)) / D;
               }
+            } else if (T.t === 'p') {
+              let edgeIdx: number | undefined;
+              if (ci.tan === tg.id && ci.tanEdge !== undefined) edgeIdx = ci.tanEdge;
+              else if (ci.tan2 === tg.id && ci.tan2Edge !== undefined) edgeIdx = ci.tan2Edge;
+              else if (ci.tanSet) {
+                const pos = ci.tanSet.indexOf(tg.id);
+                if (pos >= 0 && ci.tanEdges && ci.tanEdges[pos] !== undefined && ci.tanEdges[pos] >= 0) {
+                  edgeIdx = ci.tanEdges[pos];
+                }
+              }
+              const edgeLine =
+                edgeIdx !== undefined ? polyEdgeLine(T, edgeIdx) : nearestPolyEdge(T, C.x, C.y)?.line ?? null;
+              if (edgeLine) {
+                const denom = edgeLine.dx * edgeLine.dx + edgeLine.dy * edgeLine.dy;
+                if (denom >= 1e-12) {
+                  const t = ((C.x - edgeLine.x) * edgeLine.dx + (C.y - edgeLine.y) * edgeLine.dy) / denom;
+                  o.x = edgeLine.x + t * edgeLine.dx;
+                  o.y = edgeLine.y + t * edgeLine.dy;
+                } else {
+                  o.ok = false;
+                }
+              } else {
+                o.ok = false;
+              }
+            } else {
+              o.ok = false;
             }
           }
         } else {
@@ -419,7 +654,7 @@ export function recalc(objs: GeomObj[]): void {
 
 export function addObj(
   objs: GeomObj[],
-  obj: Omit<PointObj, 'id'> | Omit<LineObj, 'id'> | Omit<CircleObj, 'id'>
+  obj: Omit<PointObj, 'id'> | Omit<LineObj, 'id'> | Omit<CircleObj, 'id'> | Omit<PolyObj, 'id'>
 ): number {
   const id = objs.length;
   const full = { ...obj, id } as GeomObj;
@@ -429,14 +664,43 @@ export function addObj(
 }
 
 export function killObj(objs: GeomObj[], id: number): void {
-  const o = getObj(objs, id);
-  if (!o || o.dead) return;
-  o.dead = true;
-  for (const q of objs) {
-    if (!q.dead && refsOf(q).includes(id)) {
-      killObj(objs, q.id);
+  const candidateOrphanPts = new Set<number>();
+
+  const markDead = (targetId: number) => {
+    const o = getObj(objs, targetId);
+    if (!o || o.dead) return;
+    o.dead = true;
+    if (o.t !== 'pt') {
+      for (const rid of refsOf(o)) {
+        const ro = getObj(objs, rid);
+        if (ro && !ro.dead && ro.t === 'pt') {
+          candidateOrphanPts.add(ro.id);
+        }
+      }
+    }
+    for (const q of objs) {
+      if (!q.dead && refsOf(q).includes(targetId)) {
+        markDead(q.id);
+      }
+    }
+  };
+
+  markDead(id);
+
+  let pruned = true;
+  while (pruned) {
+    pruned = false;
+    for (const pid of candidateOrphanPts) {
+      const po = getObj(objs, pid);
+      if (!po || po.dead || po.t !== 'pt') continue;
+      const stillReferenced = objs.some((q) => !q.dead && refsOf(q).includes(pid));
+      if (!stillReferenced) {
+        markDead(pid);
+        pruned = true;
+      }
     }
   }
+
   recalc(objs);
 }
 
@@ -446,11 +710,11 @@ export function allInter(
   curveCache?: Array<Curve | null>,
   allowedIds?: Set<number>
 ): IntersectionPoint[] {
-  const cs: Array<{ obj: LineObj | CircleObj; cv: Curve }> = [];
+  const cs: Array<{ obj: LineObj | CircleObj | PolyObj; cv: Curve }> = [];
   const cache = curveCache ?? buildCurveCache(objs);
   for (const o of objs) {
     if (
-      (o.t === 'ln' || o.t === 'ci') &&
+      (o.t === 'ln' || o.t === 'ci' || o.t === 'pg') &&
       !o.dead &&
       (!allowedIds || allowedIds.has(o.id) || prio.has(o.id)) &&
       isPrioritized(prio, o.id)
@@ -470,6 +734,13 @@ export function allInter(
           continue;
         }
       }
+      if (ci.cv.t === 'p' || cj.cv.t === 'p') {
+        const pts = allCurveInters(ci.cv, cj.cv);
+        for (let idx = 0; idx < pts.length; idx++) {
+          out.push({ x: pts[idx][0], y: pts[idx][1], a: ci.obj.id, b: cj.obj.id, s: idx });
+        }
+        continue;
+      }
       for (const s of [1, -1]) {
         if (ci.obj.t === 'ln' && cj.obj.t === 'ln' && s < 0) continue;
         const r = inter(ci.cv, cj.cv, s);
@@ -484,6 +755,23 @@ export function distToCurve(c: Curve, x: number, y: number): number {
   if (c.t === 'c') {
     return Math.abs(Math.hypot(x - c.x, y - c.y) - c.r);
   }
+  if (c.t === 'p') {
+    let best = 1e18;
+    const n = c.verts.length;
+    for (let i = 0; i < n; i++) {
+      const a = c.verts[i];
+      const b = c.verts[(i + 1) % n];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 > 1e-12 ? Math.min(1, Math.max(0, ((x - a.x) * dx + (y - a.y) * dy) / len2)) : 0;
+      const px = a.x + t * dx;
+      const py = a.y + t * dy;
+      const d = Math.hypot(x - px, y - py);
+      if (d < best) best = d;
+    }
+    return best;
+  }
   const n = Math.hypot(c.dx, c.dy);
   if (n < 1e-12) return 1e18;
   return Math.abs((x - c.x) * c.dy - (y - c.y) * c.dx) / n;
@@ -493,6 +781,27 @@ export function projectOnCurve(c: Curve, x: number, y: number): { x: number; y: 
   if (c.t === 'c') {
     const u = Math.atan2(y - c.y, x - c.x);
     return { x: c.x + c.r * Math.cos(u), y: c.y + c.r * Math.sin(u), u };
+  }
+  if (c.t === 'p') {
+    let bestD = 1e18;
+    let bestPt = { x: c.verts[0]?.x ?? x, y: c.verts[0]?.y ?? y, u: 0 };
+    const n = c.verts.length;
+    for (let i = 0; i < n; i++) {
+      const a = c.verts[i];
+      const b = c.verts[(i + 1) % n];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 > 1e-12 ? Math.min(1, Math.max(0, ((x - a.x) * dx + (y - a.y) * dy) / len2)) : 0;
+      const px = a.x + t * dx;
+      const py = a.y + t * dy;
+      const d = Math.hypot(x - px, y - py);
+      if (d < bestD) {
+        bestD = d;
+        bestPt = { x: px, y: py, u: i + t };
+      }
+    }
+    return bestPt;
   }
   const denom = c.dx * c.dx + c.dy * c.dy;
   const u = denom > 1e-12 ? ((x - c.x) * c.dx + (y - c.y) * c.dy) / denom : 0;
@@ -527,9 +836,16 @@ export function snap(
   cachedInters?: IntersectionPoint[],
   guides?: GuideLine[],
   curveCache?: Array<Curve | null>,
-  allowedIds?: Set<number>
+  allowedIds?: Set<number>,
+  grid?: GridConfig
 ): SnapResult {
-  if (!enabled) return { k: 'free', x, y };
+  if (!enabled) {
+    if (grid) {
+      const gs = snapToGrid(x, y, viewK, snapPx, grid);
+      if (gs) return { k: 'free', x: gs.x, y: gs.y, guideTag: gs.tag };
+    }
+    return { k: 'free', x, y };
+  }
   const R = snapPx / viewK;
 
   let bestPt: { id: number; x: number; y: number; d: number } | null = null;
@@ -567,6 +883,30 @@ export function snap(
   if (bestPt) return { k: 'pt', id: bestPt.id, x: bestPt.x, y: bestPt.y };
   if (bestIn) return { k: 'in', x: bestIn.x, y: bestIn.y, a: bestIn.a, b: bestIn.b, s: bestIn.s };
 
+  // Snap to secondary polygon corners (indices 1..sides-1) as constrained points on the polygon
+  let bestPolyCorner: { id: number; u: number; x: number; y: number; d: number } | null = null;
+  for (const o of objs) {
+    if (
+      o.t === 'pg' &&
+      !o.dead &&
+      (!allowedIds || allowedIds.has(o.id) || prio.has(o.id)) &&
+      isPrioritized(prio, o.id)
+    ) {
+      const cv = curve(objs, o, curveCache);
+      if (!cv || cv.t !== 'p') continue;
+      for (let k = 1; k < cv.verts.length; k++) {
+        const v = cv.verts[k];
+        const d = Math.hypot(v.x - x, v.y - y);
+        if (d <= R && (!bestPolyCorner || d < bestPolyCorner.d)) {
+          bestPolyCorner = { id: o.id, u: k, x: v.x, y: v.y, d };
+        }
+      }
+    }
+  }
+  if (bestPolyCorner) {
+    return { k: 'on', id: bestPolyCorner.id, u: bestPolyCorner.u, x: bestPolyCorner.x, y: bestPolyCorner.y };
+  }
+
   // Check drafting guides (intersections between guides, guide x curves, and guide lines)
   if (guides && guides.length > 0) {
     const gCurves = guides.map(guideToCurve);
@@ -587,16 +927,26 @@ export function snap(
 
     // Guide x Curve intersections (only curves within 2.5*R of pointer for speed)
     for (const o of objs) {
-      if (o.dead || !isPrioritized(prio, o.id) || (o.t !== 'ln' && o.t !== 'ci')) continue;
+      if (o.dead || !isPrioritized(prio, o.id) || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
       const cv = curve(objs, o, curveCache);
       if (!cv || distToCurve(cv, x, y) > R * 2.5) continue;
       for (const gc of gCurves) {
-        for (const s of cv.t === 'l' ? [1] : [1, -1]) {
-          const pt = inter(gc, cv, s);
-          if (pt) {
+        if (cv.t === 'p') {
+          const pts = allCurveInters(gc, cv);
+          for (const pt of pts) {
             const d = Math.hypot(pt[0] - x, pt[1] - y);
             if (d <= R && (!bestGuidePt || d < bestGuidePt.d)) {
               bestGuidePt = { x: pt[0], y: pt[1], d, tag: 'Interseção guia' };
+            }
+          }
+        } else {
+          for (const s of cv.t === 'l' ? [1] : [1, -1]) {
+            const pt = inter(gc, cv, s);
+            if (pt) {
+              const d = Math.hypot(pt[0] - x, pt[1] - y);
+              if (d <= R && (!bestGuidePt || d < bestGuidePt.d)) {
+                bestGuidePt = { x: pt[0], y: pt[1], d, tag: 'Interseção guia' };
+              }
             }
           }
         }
@@ -621,6 +971,14 @@ export function snap(
     }
   }
 
+  // Work Grid snap (Modular, Isometric, Fibonacci, Golden, Polar)
+  if (grid) {
+    const gs = snapToGrid(x, y, viewK, snapPx, grid);
+    if (gs) {
+      return { k: 'free', x: gs.x, y: gs.y, guideTag: gs.tag };
+    }
+  }
+
   return { k: 'free', x, y };
 }
 
@@ -637,7 +995,7 @@ export function snapCurve(
   let bd = snapPx / viewK;
   let best: { id: number; u: number; x: number; y: number; dist: number } | null = null;
   for (const o of objs) {
-    if (o.dead || !isPrioritized(prio, o.id) || bad.has(o.id) || (o.t !== 'ln' && o.t !== 'ci')) continue;
+    if (o.dead || !isPrioritized(prio, o.id) || bad.has(o.id) || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
     const T = curve(objs, o, curveCache);
     if (!T) continue;
     const dd = distToCurve(T, x, y);
@@ -662,9 +1020,10 @@ export function safeSnap(
   cachedInters?: IntersectionPoint[],
   guides?: GuideLine[],
   curveCache?: Array<Curve | null>,
-  allowedIds?: Set<number>
+  allowedIds?: Set<number>,
+  grid?: GridConfig
 ): SnapResult {
-  const sn = snap(objs, x, y, viewK, prio, snapPx, enabled, cachedInters, guides, curveCache, allowedIds);
+  const sn = snap(objs, x, y, viewK, prio, snapPx, enabled, cachedInters, guides, curveCache, allowedIds, grid);
   if ((sn.k === 'pt' && bad.has(sn.id)) || (sn.k === 'in' && (bad.has(sn.a) || bad.has(sn.b)))) {
     return { k: 'free', x, y };
   }
@@ -688,6 +1047,47 @@ export function commitSnap(objs: GeomObj[], sn: SnapResult, phaseId?: string): n
   return addObj(objs, { t: 'pt', phaseId, free: true, x: sn.x, y: sn.y });
 }
 
+function polyEdgeSegDist(P: PolyCurve, edgeIdx: number, px: number, py: number): number {
+  const n = P.verts.length;
+  if (n < 3) return 1e18;
+  const idx = ((edgeIdx % n) + n) % n;
+  const a = P.verts[idx];
+  const b = P.verts[(idx + 1) % n];
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-12) return Math.hypot(px - a.x, py - a.y);
+  const t = Math.min(1, Math.max(0, ((px - a.x) * dx + (py - a.y) * dy) / len2));
+  return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy));
+}
+
+function polySupportTangentVertices(P: PolyCurve, ax: number, ay: number): Array<{ idx: number; x: number; y: number; s: number }> {
+  const n = P.verts.length;
+  const out: Array<{ idx: number; x: number; y: number; s: number }> = [];
+  for (let i = 0; i < n; i++) {
+    const v = P.verts[i];
+    const vx = v.x - ax;
+    const vy = v.y - ay;
+    const vLen = Math.hypot(vx, vy);
+    if (vLen < 1e-6) continue;
+    let hasPos = false;
+    let hasNeg = false;
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const w = P.verts[j];
+      const cross = vx * (w.y - ay) - vy * (w.x - ax);
+      const tol = 1e-5 * vLen * Math.hypot(w.x - ax, w.y - ay);
+      if (cross > tol) hasPos = true;
+      else if (cross < -tol) hasNeg = true;
+      if (hasPos && hasNeg) break;
+    }
+    if (!(hasPos && hasNeg)) {
+      out.push({ idx: i, x: v.x, y: v.y, s: hasPos ? 1 : -1 });
+    }
+  }
+  return out;
+}
+
 export function tangentLineFor(
   objs: GeomObj[],
   pid: number,
@@ -698,38 +1098,56 @@ export function tangentLineFor(
   snapPx: number = DEFAULT_SNAP_PX,
   curveCache?: Array<Curve | null>,
   allowedIds?: Set<number>
-): { to: number; s: number; line: LineCurve; contact: { x: number; y: number } } | null {
+): { to: number; s: number; line: LineCurve; contact: { x: number; y: number }; polyVertexIdx?: number } | null {
   const a = getObj(objs, pid);
   if (!a || a.t !== 'pt' || !a.ok) return null;
   const maxErr = snapPx / viewK;
   let bestScore = 1e18;
-  let best: { to: number; s: number; line: LineCurve; contact: { x: number; y: number } } | null = null;
+  let best: { to: number; s: number; line: LineCurve; contact: { x: number; y: number }; polyVertexIdx?: number } | null = null;
 
   for (const o of objs) {
     if (
       o.dead ||
       (!(!allowedIds || allowedIds.has(o.id) || prio.has(o.id))) ||
       !isPrioritized(prio, o.id) ||
-      o.t !== 'ci'
+      (o.t !== 'ci' && o.t !== 'pg')
     ) {
       continue;
     }
     const K = curve(objs, o, curveCache);
-    if (!K || K.t !== 'c') continue;
-    const cDist = distToCurve(K, x, y);
-    for (const s of [1, -1]) {
-      const L = tanLine(a, K, s);
-      if (!L) continue;
-      const forwardDot = (x - a.x) * L.dx + (y - a.y) * L.dy;
-      if (forwardDot < -maxErr) continue;
-      const d = distToCurve(L, x, y);
-      if (d <= maxErr) {
-        // Prefer circles closer to cursor line when multiple tangents align
-        const score = d + 0.1 * Math.min(cDist, 80 / viewK);
-        if (score < bestScore) {
-          bestScore = score;
-          const proj = projectOnCurve(L, K.x, K.y);
-          best = { to: o.id, s, line: L, contact: { x: proj.x, y: proj.y } };
+    if (!K) continue;
+    if (K.t === 'c') {
+      const cDist = distToCurve(K, x, y);
+      for (const s of [1, -1]) {
+        const L = tanLine(a, K, s);
+        if (!L) continue;
+        const forwardDot = (x - a.x) * L.dx + (y - a.y) * L.dy;
+        if (forwardDot < -maxErr) continue;
+        const d = distToCurve(L, x, y);
+        if (d <= maxErr) {
+          // Prefer circles closer to cursor line when multiple tangents align
+          const score = d + 0.1 * Math.min(cDist, 80 / viewK);
+          if (score < bestScore) {
+            bestScore = score;
+            const proj = projectOnCurve(L, K.x, K.y);
+            best = { to: o.id, s, line: L, contact: { x: proj.x, y: proj.y } };
+          }
+        }
+      }
+    } else if (K.t === 'p') {
+      const cDist = distToCurve(K, x, y);
+      const verts = polySupportTangentVertices(K, a.x, a.y);
+      for (const v of verts) {
+        const L: LineCurve = { t: 'l', x: a.x, y: a.y, dx: v.x - a.x, dy: v.y - a.y };
+        const forwardDot = (x - a.x) * L.dx + (y - a.y) * L.dy;
+        if (forwardDot < -maxErr) continue;
+        const d = distToCurve(L, x, y);
+        if (d <= maxErr) {
+          const score = d + 0.1 * Math.min(cDist, 80 / viewK);
+          if (score < bestScore) {
+            bestScore = score;
+            best = { to: o.id, s: v.s, line: L, contact: { x: v.x, y: v.y }, polyVertexIdx: v.idx };
+          }
         }
       }
     }
@@ -747,25 +1165,44 @@ export function tangentFor(
   snapPx: number = DEFAULT_SNAP_PX,
   curveCache?: Array<Curve | null>,
   allowedIds?: Set<number>
-): { tan: number; m: number; r: number } | null {
+): { tan: number; tanEdge?: number; m: number; r: number } | null {
   const c = getObj(objs, cid);
   if (!c || c.t !== 'pt' || !c.ok) return null;
   const d0 = Math.hypot(x - c.x, y - c.y);
   const maxErr = snapPx / viewK;
   let bestScore = 1e18;
-  let best: { tan: number; m: number; r: number } | null = null;
+  let best: { tan: number; tanEdge?: number; m: number; r: number } | null = null;
 
   for (const o of objs) {
     if (
       o.dead ||
       (!(!allowedIds || allowedIds.has(o.id) || prio.has(o.id))) ||
       !isPrioritized(prio, o.id) ||
-      o.t === 'pt'
+      (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')
     ) {
       continue;
     }
     const T = curve(objs, o, curveCache);
     if (!T) continue;
+    if (T.t === 'p') {
+      for (let ei = 0; ei < T.verts.length; ei++) {
+        const edgeLine = polyEdgeLine(T, ei);
+        if (!edgeLine) continue;
+        const r = tanR(edgeLine, c.x, c.y, 0);
+        if (r !== null) {
+          const err = Math.abs(r - d0);
+          if (err <= maxErr) {
+            const cDist = polyEdgeSegDist(T, ei, x, y);
+            const score = err + 0.15 * Math.min(cDist, 80 / viewK);
+            if (score < bestScore) {
+              bestScore = score;
+              best = { tan: o.id, tanEdge: ei, m: 0, r };
+            }
+          }
+        }
+      }
+      continue;
+    }
     const cDist = distToCurve(T, x, y);
     for (const m of T.t === 'l' ? [0] : [0, 1, 2]) {
       const r = tanR(T, c.x, c.y, m);
@@ -808,19 +1245,27 @@ export function tanSolve(
   let best: TanSolution | null = null;
   let bestScore = 1e18;
 
-  const cs: Array<{ id: number; T: Curve; cDist: number }> = [];
+  const cs: Array<{ id: number; edge?: number; T: LineCurve | CircleCurve; cDist: number }> = [];
   for (const o of objs) {
     if (
       o.dead ||
       (!(!allowedIds || allowedIds.has(o.id) || prio.has(o.id))) ||
       !isPrioritized(prio, o.id) ||
       bad.has(o.id) ||
-      (o.t !== 'ln' && o.t !== 'ci')
+      (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')
     ) {
       continue;
     }
     const T = curve(objs, o, curveCache);
-    if (T) {
+    if (!T) continue;
+    if (T.t === 'p') {
+      for (let ei = 0; ei < T.verts.length; ei++) {
+        const edgeLine = polyEdgeLine(T, ei);
+        if (edgeLine) {
+          cs.push({ id: o.id, edge: ei, T: edgeLine, cDist: polyEdgeSegDist(T, ei, x, y) });
+        }
+      }
+    } else {
       cs.push({ id: o.id, T, cDist: distToCurve(T, x, y) });
     }
   }
@@ -837,7 +1282,15 @@ export function tanSolve(
           const score = err + 0.15 * Math.min(c.cDist, 80 / viewK);
           if (score < bestScore) {
             bestScore = score;
-            best = { tan: c.id, sg, ang, r, cx: A.x + u[0] * r, cy: A.y + u[1] * r };
+            best = {
+              tan: c.id,
+              ...(c.edge !== undefined ? { tanEdge: c.edge } : {}),
+              sg,
+              ang,
+              r,
+              cx: A.x + u[0] * r,
+              cy: A.y + u[1] * r,
+            };
           }
         }
       }
@@ -848,6 +1301,7 @@ export function tanSolve(
   const pccPool = cs.slice(0, 28);
   for (let i = 0; i < pccPool.length; i++) {
     for (let j = i + 1; j < pccPool.length; j++) {
+      if (pccPool[i].id === pccPool[j].id) continue;
       for (const s1 of [1, -1]) {
         for (const s2 of [1, -1]) {
           pccRoots(A, pccPool[i].T, s1, pccPool[j].T, s2).forEach((q, kk) => {
@@ -860,8 +1314,10 @@ export function tanSolve(
                   bestScore = score;
                   best = {
                     tan: pccPool[i].id,
+                    ...(pccPool[i].edge !== undefined ? { tanEdge: pccPool[i].edge } : {}),
                     sg: s1,
                     tan2: pccPool[j].id,
+                    ...(pccPool[j].edge !== undefined ? { tan2Edge: pccPool[j].edge } : {}),
                     sg2: s2,
                     kk,
                     ang,
@@ -910,8 +1366,22 @@ export function commonTanFor(
 
 export function tanFields(tg: TanSolution): Partial<CircleObj> {
   return tg.tan2 !== undefined
-    ? { ang: tg.ang, tan: tg.tan, sg: tg.sg, tan2: tg.tan2, sg2: tg.sg2, kk: tg.kk }
-    : { ang: tg.ang, tan: tg.tan, sg: tg.sg };
+    ? {
+        ang: tg.ang,
+        tan: tg.tan,
+        ...(tg.tanEdge !== undefined ? { tanEdge: tg.tanEdge } : {}),
+        sg: tg.sg,
+        tan2: tg.tan2,
+        ...(tg.tan2Edge !== undefined ? { tan2Edge: tg.tan2Edge } : {}),
+        sg2: tg.sg2,
+        kk: tg.kk,
+      }
+    : {
+        ang: tg.ang,
+        tan: tg.tan,
+        ...(tg.tanEdge !== undefined ? { tanEdge: tg.tanEdge } : {}),
+        sg: tg.sg,
+      };
 }
 
 export function tanIds(tg: TanSolution): number[] {
@@ -954,7 +1424,7 @@ export function clipLine(
 }
 
 function overlapDirectionForCurve(c: CircleCurve, T: Curve): 'grow' | 'shrink' {
-  if (T.t === 'l') return 'grow';
+  if (T.t !== 'c') return 'grow';
   const D = Math.hypot(c.x - T.x, c.y - T.y);
   const dExt = Math.abs(D - (c.r + T.r));
   const dIn = Math.abs(D - (T.r - c.r));
@@ -974,7 +1444,7 @@ export function makeSVG(
   height: number,
   bg: boolean,
   overlapPx: number = DEFAULT_SVG_OVERLAP_PX,
-  options?: { phases?: Phase[]; shapes?: BuiltShape[] }
+  options?: { phases?: Phase[]; shapes?: BuiltShape[]; layers?: SvgExportLayers }
 ): string {
   let x0 = 1e18;
   let y0 = 1e18;
@@ -989,6 +1459,7 @@ export function makeSVG(
 
   const cs: Array<{ id: number; c: CircleCurve; obj: CircleObj }> = [];
   const ls: Array<{ id: number; c: LineCurve; obj: LineObj }> = [];
+  const ps: Array<{ id: number; c: PolyCurve; obj: PolyObj }> = [];
 
   for (const o of objs) {
     if (o.dead) continue;
@@ -1003,6 +1474,9 @@ export function makeSVG(
         cs.push({ id: o.id, c: { ...c }, obj: o });
       } else if (c.t === 'l' && o.t === 'ln') {
         ls.push({ id: o.id, c: { ...c }, obj: o });
+      } else if (c.t === 'p' && o.t === 'pg') {
+        for (const v of c.verts) up(v.x, v.y);
+        ps.push({ id: o.id, c: { ...c, verts: c.verts.map((v) => ({ ...v })) }, obj: o });
       }
     }
   }
@@ -1121,22 +1595,33 @@ export function makeSVG(
 
   const phases = options?.phases;
   const shapes = options?.shapes ?? [];
+  const layers = options?.layers ?? 'all';
+  const includePaths = layers === 'all' || layers === 'paths';
+  const includeGeometry = layers === 'all' || layers === 'geometry';
+
   if (phases && phases.length > 0) {
     const esc = (s: string) =>
       s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const defaultPid = phases[0].id;
     const phaseGroups = phases
       .map((ph, idx) => {
-        const pShapes = ph.showPath
-          ? shapes.filter((sh) => sh.phaseId === ph.id && sh.d)
-          : [];
-        const pCs = ph.showGeometry
-          ? cs.filter((item) => (item.obj.phaseId ?? defaultPid) === ph.id)
-          : [];
-        const pLs = ph.showGeometry
-          ? ls.filter((item) => (item.obj.phaseId ?? defaultPid) === ph.id)
-          : [];
-        if (pShapes.length === 0 && pCs.length === 0 && pLs.length === 0) return '';
+        const pShapes =
+          includePaths && ph.showPath
+            ? shapes.filter((sh) => sh.phaseId === ph.id && sh.d)
+            : [];
+        const pCs =
+          includeGeometry && ph.showGeometry
+            ? cs.filter((item) => (item.obj.phaseId ?? defaultPid) === ph.id)
+            : [];
+        const pLs =
+          includeGeometry && ph.showGeometry
+            ? ls.filter((item) => (item.obj.phaseId ?? defaultPid) === ph.id)
+            : [];
+        const pPs =
+          includeGeometry && ph.showGeometry
+            ? ps.filter((item) => (item.obj.phaseId ?? defaultPid) === ph.id)
+            : [];
+        if (pShapes.length === 0 && pCs.length === 0 && pLs.length === 0 && pPs.length === 0) return '';
 
         const pathsSvg =
           pShapes.length > 0
@@ -1146,9 +1631,15 @@ export function makeSVG(
             : '';
 
         const geomSvg =
-          pCs.length > 0 || pLs.length > 0
-            ? `<g id="fase-${idx + 1}-geometria" fill="none" stroke="${esc(ph.color)}" stroke-opacity="${f(ph.geometryOpacity)}" stroke-width="1.5" stroke-linecap="round">` +
+          pCs.length > 0 || pLs.length > 0 || pPs.length > 0
+            ? `<g id="fase-${idx + 1}-geometria" fill="none" stroke="${esc(ph.color)}" stroke-opacity="${f(ph.geometryOpacity)}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">` +
               pCs.map((item) => `<circle cx="${f(item.c.x)}" cy="${f(item.c.y)}" r="${f(item.c.r)}"/>`).join('') +
+              pPs
+                .map(
+                  (item) =>
+                    `<polygon points="${item.c.verts.map((v) => `${f(v.x)},${f(v.y)}`).join(' ')}"/>`
+                )
+                .join('') +
               pLs
                 .map((item) => {
                   const s = clipLine(item.c, x0, y0, x1, y1);
@@ -1165,21 +1656,37 @@ export function makeSVG(
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(x0)} ${f(y0)} ${f(w)} ${f(h)}" width="${f(w)}" height="${f(h)}">${bgr}${phaseGroups}</svg>`;
   }
 
-  const circ =
-    '<g id="circulos" fill="none" stroke="#000" stroke-width="1.5">' +
-    cs.map((item) => `<circle cx="${f(item.c.x)}" cy="${f(item.c.y)}" r="${f(item.c.r)}"/>`).join('') +
-    '</g>';
-  const ret =
-    '<g id="retas" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round">' +
-    ls
-      .map((item) => {
-        const s = clipLine(item.c, x0, y0, x1, y1);
-        return s ? `<line x1="${f(s[0])}" y1="${f(s[1])}" x2="${f(s[2])}" y2="${f(s[3])}"/>` : '';
-      })
-      .join('') +
-    '</g>';
+  const pathsFallback =
+    includePaths && shapes.length > 0
+      ? '<g id="paths" fill="#111827" fill-opacity="0.45" fill-rule="evenodd" stroke="none">' +
+        shapes.filter((sh) => sh.d).map((sh) => `<path d="${sh.d}"/>`).join('') +
+        '</g>'
+      : '';
+  const circ = includeGeometry
+    ? '<g id="circulos" fill="none" stroke="#000" stroke-width="1.5">' +
+      cs.map((item) => `<circle cx="${f(item.c.x)}" cy="${f(item.c.y)}" r="${f(item.c.r)}"/>`).join('') +
+      '</g>'
+    : '';
+  const polys =
+    includeGeometry && ps.length > 0
+      ? '<g id="poligonos" fill="none" stroke="#000" stroke-width="1.5" stroke-linejoin="round">' +
+        ps
+          .map((item) => `<polygon points="${item.c.verts.map((v) => `${f(v.x)},${f(v.y)}`).join(' ')}"/>`)
+          .join('') +
+        '</g>'
+      : '';
+  const ret = includeGeometry
+    ? '<g id="retas" fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round">' +
+      ls
+        .map((item) => {
+          const s = clipLine(item.c, x0, y0, x1, y1);
+          return s ? `<line x1="${f(s[0])}" y1="${f(s[1])}" x2="${f(s[2])}" y2="${f(s[3])}"/>` : '';
+        })
+        .join('') +
+      '</g>'
+    : '';
 
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(x0)} ${f(y0)} ${f(w)} ${f(h)}" width="${f(w)}" height="${f(h)}">${bgr}${circ}${ret}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${f(x0)} ${f(y0)} ${f(w)} ${f(h)}" width="${f(w)}" height="${f(h)}">${bgr}${pathsFallback}${circ}${polys}${ret}</svg>`;
 }
 
 /**
@@ -1214,7 +1721,15 @@ export function buildCopySubgraph(objs: GeomObj[], selectedIds: Set<number>): Co
     }
     const id = temp.length;
     oldToNew.set(ptId, id);
-    temp.push({ id, t: 'pt', free: true, x: orig.x, y: orig.y, ok: true });
+    temp.push({
+      id,
+      t: 'pt',
+      free: true,
+      x: orig.x,
+      y: orig.y,
+      ok: true,
+      ...(orig.groupId ? { groupId: orig.groupId } : {}),
+    });
     return id;
   };
 
@@ -1257,8 +1772,30 @@ export function buildCopySubgraph(objs: GeomObj[], selectedIds: Set<number>): Co
         }
         const id = temp.length;
         oldToNew.set(o.id, id);
-        temp.push({ id, t: 'ln', a: pA, b: pB });
+        temp.push({
+          id,
+          t: 'ln',
+          a: pA,
+          b: pB,
+          ...(o.groupId ? { groupId: o.groupId } : {}),
+        });
       }
+    } else if (o.t === 'pg') {
+      const P = curve(objs, o);
+      if (!P || P.t !== 'p') continue;
+      const pCenter = ensurePointCopied(o.c);
+      const pCorner = ensurePointCopied(o.p);
+      const id = temp.length;
+      oldToNew.set(o.id, id);
+      temp.push({
+        id,
+        t: 'pg',
+        c: pCenter,
+        p: pCorner,
+        sides: o.sides,
+        ...(o.scaleLocked ? { scaleLocked: true } : {}),
+        ...(o.groupId ? { groupId: o.groupId } : {}),
+      });
     } else if (o.t === 'ci') {
       const parents = refsOf(o);
       const keepParametric = parents.length > 0 && parents.every((p) => selectedIds.has(p));
@@ -1267,6 +1804,7 @@ export function buildCopySubgraph(objs: GeomObj[], selectedIds: Set<number>): Co
           ...o,
           id: temp.length,
           tanSet: o.tanSet ? [...o.tanSet] : undefined,
+          tanEdges: o.tanEdges ? [...o.tanEdges] : undefined,
           tanSigns: o.tanSigns ? [...o.tanSigns] : undefined,
           tanRef: o.tanRef ? { ...o.tanRef } : undefined,
         };
@@ -1284,7 +1822,14 @@ export function buildCopySubgraph(objs: GeomObj[], selectedIds: Set<number>): Co
         const pEdge = o.p !== undefined ? ensurePointCopied(o.p) : ensureFreePoint(C.x + C.r, C.y);
         const id = temp.length;
         oldToNew.set(o.id, id);
-        temp.push({ id, t: 'ci', c: pCenter, p: pEdge });
+        temp.push({
+          id,
+          t: 'ci',
+          c: pCenter,
+          p: pEdge,
+          ...(o.scaleLocked ? { scaleLocked: true } : {}),
+          ...(o.groupId ? { groupId: o.groupId } : {}),
+        });
       }
     }
   }
@@ -1355,6 +1900,8 @@ export function pasteSubgraph(
   const next = cloneObjs(objs);
   const baseId = next.length;
   const pastedIds: number[] = [];
+  const groupRemap = new Map<string, string>();
+  const stampBase = Date.now();
 
   for (const raw of copied.items) {
     const item =
@@ -1365,6 +1912,14 @@ export function pasteSubgraph(
     item.id = newId;
     if (targetPhaseId !== undefined) {
       item.phaseId = targetPhaseId;
+    }
+    if (item.groupId) {
+      let remapped = groupRemap.get(item.groupId);
+      if (!remapped) {
+        remapped = `grp-${stampBase}-${groupRemap.size + 1}`;
+        groupRemap.set(item.groupId, remapped);
+      }
+      item.groupId = remapped;
     }
 
     if (item.t === 'pt') {
@@ -1382,6 +1937,9 @@ export function pasteSubgraph(
       if (item.b !== undefined) item.b += baseId;
       if (item.to !== undefined) item.to += baseId;
       if (item.cc) item.cc = [item.cc[0] + baseId, item.cc[1] + baseId];
+    } else if (item.t === 'pg') {
+      item.c += baseId;
+      item.p += baseId;
     } else {
       if (item.c !== undefined) item.c += baseId;
       if (item.p !== undefined) item.p += baseId;
@@ -1391,6 +1949,7 @@ export function pasteSubgraph(
       if (item.tan !== undefined) item.tan += baseId;
       if (item.tan2 !== undefined) item.tan2 += baseId;
       if (item.tanSet) item.tanSet = item.tanSet.map((tid) => tid + baseId);
+      if (item.tanEdges) item.tanEdges = [...item.tanEdges];
       if (item.tanSigns) item.tanSigns = [...item.tanSigns];
       if (item.tanRef) item.tanRef = { x: item.tanRef.x + dx, y: item.tanRef.y + dy, r: item.tanRef.r };
     }
@@ -1444,6 +2003,7 @@ export function movableRootPointsForSelection(objs: GeomObj[], ids: Set<number>)
 }
 
 function offsetCurveAtRadius(T: Curve, refCx: number, refCy: number, oldR: number, newR: number): Curve | null {
+  if (T.t === 'p') return null;
   if (T.t === 'l') {
     const proj = projectOnCurve(T, refCx, refCy);
     const vx = refCx - proj.x;
@@ -1496,6 +2056,9 @@ export function setCircleRadius(
   if (!o || o.dead || o.t !== 'ci') {
     return { ok: false, reason: 'Círculo não encontrado.' };
   }
+  if (o.scaleLocked) {
+    return { ok: false, reason: 'Escala travada — desbloqueie para redimensionar.' };
+  }
 
   const C = curve(next, o);
   if (!C || C.t !== 'c') {
@@ -1543,8 +2106,8 @@ export function setCircleRadius(
     }
   } else if (o.c !== undefined && o.tan !== undefined) {
     const pc = getObj(next, o.c);
-    const T = curve(next, getObj(next, o.tan));
-    if (!pc || pc.t !== 'pt' || !T) {
+    const T = resolveCurveForTan(o.tan, o.tanEdge, { x: C.x, y: C.y }, (id) => curve(next, getObj(next, id)));
+    if (!pc || pc.t !== 'pt' || !T || T.t === 'p') {
       return { ok: false, reason: 'Referência de tangência inválida.' };
     }
 
@@ -1562,7 +2125,7 @@ export function setCircleRadius(
       const targetD = m === 0 ? T.r + newR : m === 1 ? T.r - newR : newR - T.r;
       off = { t: 'c', x: T.x, y: T.y, r: targetD };
     }
-    if (!off) return { ok: false, reason: 'Raio incompatível com a tangência.' };
+    if (!off || off.t === 'p') return { ok: false, reason: 'Raio incompatível com a tangência.' };
 
     if (pc.free) {
       if (off.t === 'l') {
@@ -1600,7 +2163,7 @@ export function setCircleRadius(
     }
   } else if (o.e !== undefined && o.tan !== undefined) {
     const pe = getObj(next, o.e);
-    const T1 = curve(next, getObj(next, o.tan));
+    const T1 = resolveCurveForTan(o.tan, o.tanEdge, pe && pe.t === 'pt' ? pe : undefined, (id) => curve(next, getObj(next, id)));
     if (!pe || pe.t !== 'pt' || !T1) {
       return { ok: false, reason: 'Referência de tangência inválida.' };
     }
@@ -1628,7 +2191,7 @@ export function setCircleRadius(
       }
       o.ang = Math.atan2(bestPt[1] - pe.y, bestPt[0] - pe.x);
     } else {
-      const T2 = curve(next, getObj(next, o.tan2));
+      const T2 = resolveCurveForTan(o.tan2, o.tan2Edge, pe, (id) => curve(next, getObj(next, id)));
       if (!T2) return { ok: false, reason: 'Segunda tangente inválida.' };
       const off2 = offsetCurveAtRadius(T2, C.x, C.y, C.r, newR);
       if (!off2) {
@@ -1683,8 +2246,8 @@ export function setCircleRadius(
         reason: 'Círculo tangente a 3 ou mais objetos tem raio fixado pelas tangências.',
       };
     }
-    const T1 = targetFromObj(next, o.tanSet[0], (id) => curve(next, getObj(next, id)));
-    const T2 = targetFromObj(next, o.tanSet[1], (id) => curve(next, getObj(next, id)));
+    const T1 = targetFromObj(next, o.tanSet[0], (id) => curve(next, getObj(next, id)), o.tanEdges?.[0], C.x, C.y);
+    const T2 = targetFromObj(next, o.tanSet[1], (id) => curve(next, getObj(next, id)), o.tanEdges?.[1], C.x, C.y);
     if (!T1 || !T2) {
       return { ok: false, reason: 'Objetos tangentes inválidos.' };
     }
@@ -1725,32 +2288,107 @@ export function setCircleRadius(
   return { ok: true, next };
 }
 
+export function setPolygonSide(
+  objs: GeomObj[],
+  polyId: number,
+  newSide: number
+): { ok: boolean; next?: GeomObj[]; reason?: string } {
+  if (!Number.isFinite(newSide) || newSide <= 1e-3) {
+    return { ok: false, reason: 'O lado precisa ser maior que zero.' };
+  }
+  const next = cloneObjs(objs);
+  const o = getObj(next, polyId);
+  if (!o || o.dead || o.t !== 'pg') {
+    return { ok: false, reason: 'Polígono não encontrado.' };
+  }
+  if (o.scaleLocked) {
+    return { ok: false, reason: 'Escala travada — desbloqueie para alterar o lado.' };
+  }
+  const P = curve(next, o);
+  if (!P || P.t !== 'p') {
+    return { ok: false, reason: 'Geometria do polígono inválida.' };
+  }
+  const pc = getObj(next, o.c);
+  const pp = getObj(next, o.p);
+  if (!pc || pc.t !== 'pt' || !pp || pp.t !== 'pt') {
+    return { ok: false, reason: 'Pontos do polígono inválidos.' };
+  }
+  const newR = newSide / (2 * Math.sin(Math.PI / P.sides));
+  if (pp.free) {
+    const ang = Math.atan2(pp.y - P.cy, pp.x - P.cx);
+    pp.x = P.cx + newR * Math.cos(ang);
+    pp.y = P.cy + newR * Math.sin(ang);
+  } else if (pc.free) {
+    const ang = Math.atan2(pc.y - pp.y, pc.x - pp.x);
+    pc.x = pp.x + newR * Math.cos(ang);
+    pc.y = pp.y + newR * Math.sin(ang);
+  } else {
+    return { ok: false, reason: 'Centro e vértice estão presos a interseções.' };
+  }
+  recalc(next);
+  return { ok: true, next };
+}
+
 type TanTarget =
   | { kind: 'p'; id: number; x: number; y: number; r: 0 }
   | { kind: 'l'; id: number; nx: number; ny: number; d0: number; raw: LineCurve }
   | { kind: 'c'; id: number; x: number; y: number; r: number };
 
-function targetFromObj(
+function resolveTargetFromObj(
   objs: GeomObj[],
   id: number | undefined,
-  getCurve: (id: number | undefined) => Curve | null
-): TanTarget | null {
+  getCurve: (id: number | undefined) => Curve | null,
+  edgeIdx?: number,
+  hx?: number,
+  hy?: number
+): { target: TanTarget; edge?: number } | null {
   const o = getObj(objs, id);
   if (!o || o.dead) return null;
   if (o.t === 'pt') {
     if (!o.ok) return null;
-    return { kind: 'p', id: o.id, x: o.x, y: o.y, r: 0 };
+    return { target: { kind: 'p', id: o.id, x: o.x, y: o.y, r: 0 } };
   }
   const cv = getCurve(o.id);
   if (!cv) return null;
+  if (cv.t === 'p') {
+    let resolvedEdge = edgeIdx !== undefined && edgeIdx >= 0 ? edgeIdx : undefined;
+    let edgeLine: LineCurve | null = resolvedEdge !== undefined ? polyEdgeLine(cv, resolvedEdge) : null;
+    if (!edgeLine) {
+      const near = nearestPolyEdge(cv, hx ?? cv.cx, hy ?? cv.cy);
+      if (near) {
+        resolvedEdge = near.edge;
+        edgeLine = near.line;
+      }
+    }
+    if (!edgeLine) return null;
+    const n = Math.hypot(edgeLine.dx, edgeLine.dy);
+    if (n < 1e-12) return null;
+    const nx = -edgeLine.dy / n;
+    const ny = edgeLine.dx / n;
+    return {
+      target: { kind: 'l', id: o.id, nx, ny, d0: nx * edgeLine.x + ny * edgeLine.y, raw: edgeLine },
+      edge: resolvedEdge,
+    };
+  }
   if (cv.t === 'l') {
     const n = Math.hypot(cv.dx, cv.dy);
     if (n < 1e-12) return null;
     const nx = -cv.dy / n;
     const ny = cv.dx / n;
-    return { kind: 'l', id: o.id, nx, ny, d0: nx * cv.x + ny * cv.y, raw: cv };
+    return { target: { kind: 'l', id: o.id, nx, ny, d0: nx * cv.x + ny * cv.y, raw: cv } };
   }
-  return { kind: 'c', id: o.id, x: cv.x, y: cv.y, r: cv.r };
+  return { target: { kind: 'c', id: o.id, x: cv.x, y: cv.y, r: cv.r } };
+}
+
+function targetFromObj(
+  objs: GeomObj[],
+  id: number | undefined,
+  getCurve: (id: number | undefined) => Curve | null,
+  edgeIdx?: number,
+  hx?: number,
+  hy?: number
+): TanTarget | null {
+  return resolveTargetFromObj(objs, id, getCurve, edgeIdx, hx, hy)?.target ?? null;
 }
 
 function targetOffsetCurve(T: TanTarget, sg: number, r: number): Curve | null {
@@ -2397,29 +3035,38 @@ export function solveMultiTangent(
 ): MultiTanSolution[] {
   if (selected.length < 2 || selected.length > 4) return [];
   const targets: TanTarget[] = [];
+  const edges: Array<number | undefined> = [];
   const hints: Array<{ x: number; y: number }> = [];
   for (const sel of selected) {
-    const T = targetFromObj(objs, sel.id, (id) => curve(objs, getObj(objs, id), curveCache));
-    if (!T) return [];
-    targets.push(T);
+    const res = resolveTargetFromObj(
+      objs,
+      sel.id,
+      (id) => curve(objs, getObj(objs, id), curveCache),
+      sel.edge,
+      sel.hx,
+      sel.hy
+    );
+    if (!res) return [];
+    targets.push(res.target);
+    edges.push(res.edge);
     hints.push({ x: sel.hx, y: sel.hy });
   }
 
+  let sols: MultiTanSolution[];
   if (targets.length === 2) {
-    return solveTangent2All(targets[0], targets[1], x, y, hints);
-  }
-
-  if (targets.length === 3) {
+    sols = solveTangent2All(targets[0], targets[1], x, y, hints);
+  } else if (targets.length === 3) {
     const cands = apollonius3Candidates(targets[0], targets[1], targets[2]);
     cands.sort((a, b) => {
       const sa = Math.abs(Math.hypot(x - a.cx, y - a.cy) - a.r) + 0.18 * Math.hypot(x - a.cx, y - a.cy);
       const sb = Math.abs(Math.hypot(x - b.cx, y - b.cy) - b.r) + 0.18 * Math.hypot(x - b.cx, y - b.cy);
       return sa - sb;
     });
-    return cands;
+    sols = cands;
+  } else {
+    sols = solveTangent4All(targets, x, y);
   }
-
-  return solveTangent4All(targets, x, y);
+  return sols.map((s) => ({ ...s, edges }));
 }
 
 function resolveMultiTanCircleWith(
@@ -2429,8 +3076,8 @@ function resolveMultiTanCircleWith(
 ): CircleCurve | null {
   if (!o.tanSet || o.tanSet.length < 2 || !o.tanRef) return null;
   const targets: TanTarget[] = [];
-  for (const id of o.tanSet) {
-    const T = targetFromObj(objs, id, getCurve);
+  for (let i = 0; i < o.tanSet.length; i++) {
+    const T = targetFromObj(objs, o.tanSet[i], getCurve, o.tanEdges?.[i], o.tanRef.x, o.tanRef.y);
     if (!T) return null;
     targets.push(T);
   }
@@ -2572,8 +3219,14 @@ export function canCurveConnectTangent(
     return true;
   }
 
+  if (first.t === 'pg') {
+    const pc = getObj(objs, first.c);
+    const pp = getObj(objs, first.p);
+    return !!pc && !!pp && pc.t === 'pt' && pp.t === 'pt' && !!pc.ok && !!pp.ok && pc.free && pp.free;
+  }
+
   // first.t === 'ln'
-  if (second.t !== 'ci') return false;
+  if (second.t !== 'ci' && second.t !== 'pg') return false;
   if (first.a === undefined || first.b === undefined) return false;
   const pa = getObj(objs, first.a);
   const pb = getObj(objs, first.b);
@@ -2582,6 +3235,15 @@ export function canCurveConnectTangent(
   if (options?.anchorEnd === 'b') return pa.free;
   if (options?.forDrag) return pa.free && pb.free;
   return pa.free || pb.free;
+}
+
+function translatedPolyCurve(P: PolyCurve, dx: number, dy: number): PolyCurve {
+  return {
+    ...P,
+    cx: P.cx + dx,
+    cy: P.cy + dy,
+    verts: P.verts.map((v) => ({ x: v.x + dx, y: v.y + dy })),
+  };
 }
 
 export function computeTangencyCandidates(
@@ -2606,12 +3268,17 @@ export function computeTangencyCandidates(
   const out: TangencyCandidate[] = [];
 
   if (C1.t === 'c' && C2.t === 'c' && first.t === 'ci') {
-    let useFixedCenter = !!options?.fixedCenter;
-    if (!useFixedCenter && first.c !== undefined && first.tan === undefined) {
+    if (first.scaleLocked && options?.fixedCenter) return [];
+    let useFixedCenter = !first.scaleLocked && !!options?.fixedCenter;
+    if (!first.scaleLocked && !useFixedCenter && first.c !== undefined && first.tan === undefined) {
       const pc = getObj(objs, first.c);
       if (pc && pc.t === 'pt' && !pc.free) {
         useFixedCenter = true;
       }
+    }
+    if (first.scaleLocked && first.c !== undefined && first.tan === undefined) {
+      const pc = getObj(objs, first.c);
+      if (pc && pc.t === 'pt' && !pc.free) return [];
     }
 
     const dx = C1.x - C2.x;
@@ -2764,12 +3431,17 @@ export function computeTangencyCandidates(
   }
 
   if (C1.t === 'c' && C2.t === 'l' && first.t === 'ci') {
-    let useFixedCenter = !!options?.fixedCenter;
-    if (!useFixedCenter && first.c !== undefined && first.tan === undefined) {
+    if (first.scaleLocked && options?.fixedCenter) return [];
+    let useFixedCenter = !first.scaleLocked && !!options?.fixedCenter;
+    if (!first.scaleLocked && !useFixedCenter && first.c !== undefined && first.tan === undefined) {
       const pc = getObj(objs, first.c);
       if (pc && pc.t === 'pt' && !pc.free) {
         useFixedCenter = true;
       }
+    }
+    if (first.scaleLocked && first.c !== undefined && first.tan === undefined) {
+      const pc = getObj(objs, first.c);
+      if (pc && pc.t === 'pt' && !pc.free) return [];
     }
     const proj = projectOnCurve(C2, C1.x, C1.y);
     const vx = C1.x - proj.x;
@@ -2815,6 +3487,244 @@ export function computeTangencyCandidates(
         newRadius: C1.r,
         gap: Math.abs(d - C1.r),
         label: 'Tangente à reta',
+      });
+    }
+    return out;
+  }
+
+  if (C1.t === 'c' && C2.t === 'p' && first.t === 'ci') {
+    if (first.scaleLocked && options?.fixedCenter) return [];
+    let useFixedCenter = !first.scaleLocked && !!options?.fixedCenter;
+    if (!first.scaleLocked && !useFixedCenter && first.c !== undefined && first.tan === undefined) {
+      const pc = getObj(objs, first.c);
+      if (pc && pc.t === 'pt' && !pc.free) {
+        useFixedCenter = true;
+      }
+    }
+    if (first.scaleLocked && first.c !== undefined && first.tan === undefined) {
+      const pc = getObj(objs, first.c);
+      if (pc && pc.t === 'pt' && !pc.free) return [];
+    }
+    for (let ei = 0; ei < C2.verts.length; ei++) {
+      const edgeLine = polyEdgeLine(C2, ei);
+      if (!edgeLine) continue;
+      const proj = projectOnCurve(edgeLine, C1.x, C1.y);
+      const vx = C1.x - proj.x;
+      const vy = C1.y - proj.y;
+      const d = Math.hypot(vx, vy);
+      const lLen = Math.hypot(edgeLine.dx, edgeLine.dy) || 1;
+      const nx = d > 1e-6 ? vx / d : -edgeLine.dy / lLen;
+      const ny = d > 1e-6 ? vy / d : edgeLine.dx / lLen;
+      const contact = { x: proj.x, y: proj.y };
+      const segD = polyEdgeSegDist(C2, ei, C1.x, C1.y);
+      const extBias = segD > d + 1e-3 ? (segD - d) * 0.2 : 0;
+
+      if (useFixedCenter) {
+        if (d > 1e-2) {
+          out.push({
+            key: `${firstId}-${secondId}-ci-pg-${ei}-fc`,
+            firstId,
+            secondId,
+            contact,
+            previewCurve: { t: 'c', x: C1.x, y: C1.y, r: d },
+            guideline: { x1: C1.x, y1: C1.y, x2: contact.x, y2: contact.y },
+            kind: 'ci-pg',
+            tanEdge: ei,
+            m: 0,
+            fixedCenter: true,
+            newCenter: { x: C1.x, y: C1.y },
+            newRadius: d,
+            gap: Math.abs(C1.r - d) + extBias,
+            label: 'Tangente à aresta',
+          });
+        }
+      } else {
+        const cx = contact.x + C1.r * nx;
+        const cy = contact.y + C1.r * ny;
+        out.push({
+          key: `${firstId}-${secondId}-ci-pg-${ei}-mv`,
+          firstId,
+          secondId,
+          contact,
+          previewCurve: { t: 'c', x: cx, y: cy, r: C1.r },
+          guideline: { x1: cx, y1: cy, x2: contact.x, y2: contact.y },
+          kind: 'ci-pg',
+          tanEdge: ei,
+          m: 0,
+          fixedCenter: false,
+          newCenter: { x: cx, y: cy },
+          newRadius: C1.r,
+          gap: Math.abs(d - C1.r) + extBias,
+          label: 'Tangente à aresta',
+        });
+      }
+    }
+    return out;
+  }
+
+  if (C1.t === 'p' && C2.t === 'c' && first.t === 'pg') {
+    const n = C1.verts.length;
+    for (let ei = 0; ei < n; ei++) {
+      const a = C1.verts[ei];
+      const b = C1.verts[(ei + 1) % n];
+      const ex = b.x - a.x;
+      const ey = b.y - a.y;
+      const eLen = Math.hypot(ex, ey);
+      if (eLen < 1e-6) continue;
+      let nx = ey / eLen;
+      let ny = -ex / eLen;
+      if ((a.x - C1.cx) * nx + (a.y - C1.cy) * ny < 0) {
+        nx = -nx;
+        ny = -ny;
+      }
+
+      // External edge tangency to circle
+      const contactOut = { x: C2.x - C2.r * nx, y: C2.y - C2.r * ny };
+      const deltaOut = (contactOut.x - a.x) * nx + (contactOut.y - a.y) * ny;
+      const dxOut = deltaOut * nx;
+      const dyOut = deltaOut * ny;
+      const tSegOut = ((contactOut.x - (a.x + dxOut)) * ex + (contactOut.y - (a.y + dyOut)) * ey) / (eLen * eLen);
+      if (tSegOut >= -0.25 && tSegOut <= 1.25) {
+        out.push({
+          key: `${firstId}-${secondId}-pg-ci-edge-${ei}`,
+          firstId,
+          secondId,
+          contact: contactOut,
+          previewCurve: translatedPolyCurve(C1, dxOut, dyOut),
+          guideline: { x1: C2.x, y1: C2.y, x2: contactOut.x, y2: contactOut.y },
+          kind: 'pg-ci',
+          tanEdge: ei,
+          newCenter: { x: dxOut, y: dyOut },
+          gap: Math.abs(deltaOut),
+          label: 'Aresta tangente ao círculo',
+        });
+      }
+
+      // Inscribed circle inside polygon edge
+      if (C1.r > C2.r + 1e-2) {
+        const contactIn = { x: C2.x + C2.r * nx, y: C2.y + C2.r * ny };
+        const deltaIn = (contactIn.x - a.x) * nx + (contactIn.y - a.y) * ny;
+        const dxIn = deltaIn * nx;
+        const dyIn = deltaIn * ny;
+        const tSegIn = ((contactIn.x - (a.x + dxIn)) * ex + (contactIn.y - (a.y + dyIn)) * ey) / (eLen * eLen);
+        if (tSegIn >= -0.1 && tSegIn <= 1.1) {
+          out.push({
+            key: `${firstId}-${secondId}-pg-ci-in-${ei}`,
+            firstId,
+            secondId,
+            contact: contactIn,
+            previewCurve: translatedPolyCurve(C1, dxIn, dyIn),
+            guideline: { x1: C2.x, y1: C2.y, x2: contactIn.x, y2: contactIn.y },
+            kind: 'pg-ci',
+            tanEdge: ei,
+            newCenter: { x: dxIn, y: dyIn },
+            gap: Math.abs(deltaIn),
+            label: 'Aresta tangente ao círculo',
+          });
+        }
+      }
+    }
+
+    // Polygon vertex touching circle rim
+    for (let vi = 0; vi < n; vi++) {
+      const v = C1.verts[vi];
+      const vx = v.x - C2.x;
+      const vy = v.y - C2.y;
+      const D = Math.hypot(vx, vy);
+      if (D < 1e-6) continue;
+      const contact = { x: C2.x + (C2.r * vx) / D, y: C2.y + (C2.r * vy) / D };
+      const dx = contact.x - v.x;
+      const dy = contact.y - v.y;
+      out.push({
+        key: `${firstId}-${secondId}-pg-ci-v-${vi}`,
+        firstId,
+        secondId,
+        contact,
+        previewCurve: translatedPolyCurve(C1, dx, dy),
+        guideline: { x1: C2.x, y1: C2.y, x2: contact.x, y2: contact.y },
+        kind: 'pg-ci',
+        newCenter: { x: dx, y: dy },
+        gap: Math.hypot(dx, dy),
+        label: 'Vértice no círculo',
+      });
+    }
+    return out;
+  }
+
+  if (C1.t === 'p' && C2.t === 'l' && first.t === 'pg') {
+    for (let vi = 0; vi < C1.verts.length; vi++) {
+      const v = C1.verts[vi];
+      const proj = projectOnCurve(C2, v.x, v.y);
+      const dx = proj.x - v.x;
+      const dy = proj.y - v.y;
+      out.push({
+        key: `${firstId}-${secondId}-pg-ln-v-${vi}`,
+        firstId,
+        secondId,
+        contact: { x: proj.x, y: proj.y },
+        previewCurve: translatedPolyCurve(C1, dx, dy),
+        kind: 'pg-ln',
+        newCenter: { x: dx, y: dy },
+        gap: Math.hypot(dx, dy),
+        label: 'Vértice na reta',
+      });
+    }
+    return out;
+  }
+
+  if (C1.t === 'p' && C2.t === 'p' && first.t === 'pg') {
+    const projectToSeg = (px: number, py: number, P: PolyCurve) => {
+      let best = { x: px, y: py, d: 1e18, edge: 0 };
+      const m = P.verts.length;
+      for (let i = 0; i < m; i++) {
+        const a = P.verts[i];
+        const b = P.verts[(i + 1) % m];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len2 = dx * dx + dy * dy;
+        const t = len2 > 1e-12 ? Math.min(1, Math.max(0, ((px - a.x) * dx + (py - a.y) * dy) / len2)) : 0;
+        const fx = a.x + t * dx;
+        const fy = a.y + t * dy;
+        const d = Math.hypot(px - fx, py - fy);
+        if (d < best.d) best = { x: fx, y: fy, d, edge: i };
+      }
+      return best;
+    };
+
+    for (let vi = 0; vi < C1.verts.length; vi++) {
+      const v = C1.verts[vi];
+      const foot = projectToSeg(v.x, v.y, C2);
+      const dx = foot.x - v.x;
+      const dy = foot.y - v.y;
+      out.push({
+        key: `${firstId}-${secondId}-pg-pg-v1-${vi}`,
+        firstId,
+        secondId,
+        contact: { x: foot.x, y: foot.y },
+        previewCurve: translatedPolyCurve(C1, dx, dy),
+        kind: 'pg-pg',
+        tanEdge: foot.edge,
+        newCenter: { x: dx, y: dy },
+        gap: foot.d,
+        label: 'Vértice na aresta',
+      });
+    }
+    for (let wi = 0; wi < C2.verts.length; wi++) {
+      const w = C2.verts[wi];
+      const foot = projectToSeg(w.x, w.y, C1);
+      const dx = w.x - foot.x;
+      const dy = w.y - foot.y;
+      out.push({
+        key: `${firstId}-${secondId}-pg-pg-v2-${wi}`,
+        firstId,
+        secondId,
+        contact: { x: w.x, y: w.y },
+        previewCurve: translatedPolyCurve(C1, dx, dy),
+        kind: 'pg-pg',
+        tanEdge: foot.edge,
+        newCenter: { x: dx, y: dy },
+        gap: foot.d,
+        label: 'Aresta no vértice',
       });
     }
     return out;
@@ -2874,6 +3784,59 @@ export function computeTangencyCandidates(
         anchorEnd,
         gap,
         label: 'Reta tangente',
+      });
+    }
+    return out;
+  }
+
+  if (C1.t === 'l' && C2.t === 'p' && first.t === 'ln' && first.a !== undefined && first.b !== undefined) {
+    const pa = getObj(objs, first.a);
+    const pb = getObj(objs, first.b);
+    if (!pa || !pb || pa.t !== 'pt' || pb.t !== 'pt' || !pa.ok || !pb.ok) return out;
+
+    if (options?.forDrag && !options?.anchorEnd && pa.free && pb.free) {
+      for (let vi = 0; vi < C2.verts.length; vi++) {
+        const v = C2.verts[vi];
+        const proj = projectOnCurve(C1, v.x, v.y);
+        const dxShift = v.x - proj.x;
+        const dyShift = v.y - proj.y;
+        out.push({
+          key: `${firstId}-${secondId}-ln-pg-rigid-${vi}`,
+          firstId,
+          secondId,
+          contact: { x: v.x, y: v.y },
+          previewCurve: { t: 'l', x: C1.x + dxShift, y: C1.y + dyShift, dx: C1.dx, dy: C1.dy },
+          kind: 'ln-pg',
+          tanEdge: vi,
+          newCenter: { x: dxShift, y: dyShift },
+          gap: Math.hypot(dxShift, dyShift),
+          label: 'Reta tangente ao vértice',
+        });
+      }
+      return out;
+    }
+
+    const anchorEnd: 'a' | 'b' = options?.anchorEnd ?? (pb.free ? 'a' : 'b');
+    const anchorPt = anchorEnd === 'a' ? pa : pb;
+    const movingPt = anchorEnd === 'a' ? pb : pa;
+    const verts = polySupportTangentVertices(C2, anchorPt.x, anchorPt.y);
+    for (const v of verts) {
+      const TL: LineCurve = { t: 'l', x: anchorPt.x, y: anchorPt.y, dx: v.x - anchorPt.x, dy: v.y - anchorPt.y };
+      const forwardDot = (movingPt.x - anchorPt.x) * TL.dx + (movingPt.y - anchorPt.y) * TL.dy;
+      const gap = forwardDot >= -1e-3 ? distToCurve(TL, movingPt.x, movingPt.y) : 1e9;
+      out.push({
+        key: `${firstId}-${secondId}-ln-pg-${v.idx}`,
+        firstId,
+        secondId,
+        contact: { x: v.x, y: v.y },
+        previewCurve: TL,
+        guideline: { x1: C2.cx, y1: C2.cy, x2: v.x, y2: v.y },
+        kind: 'ln-pg',
+        tanEdge: v.idx,
+        s: v.s,
+        anchorEnd,
+        gap,
+        label: 'Tangente ao vértice',
       });
     }
   }
@@ -2941,7 +3904,7 @@ export function applyDragTangencySnap(objs: GeomObj[], cand: TangencyCandidate):
   const first = getObj(objs, cand.firstId);
   if (!first || first.dead) return;
 
-  if ((cand.kind === 'ci-ci' || cand.kind === 'ci-ln') && first.t === 'ci') {
+  if ((cand.kind === 'ci-ci' || cand.kind === 'ci-ln' || cand.kind === 'ci-pg') && first.t === 'ci') {
     const C1 = curve(objs, first);
     if (!C1 || C1.t !== 'c') return;
 
@@ -2992,13 +3955,39 @@ export function applyDragTangencySnap(objs: GeomObj[], cand: TangencyCandidate):
     return;
   }
 
-  if (cand.kind === 'ln-ci' && first.t === 'ln') {
+  if ((cand.kind === 'pg-ci' || cand.kind === 'pg-ln' || cand.kind === 'pg-pg') && first.t === 'pg' && cand.newCenter) {
+    const pc = getObj(objs, first.c);
+    const pp = getObj(objs, first.p);
+    if (pc && pc.t === 'pt' && pc.free) {
+      pc.x += cand.newCenter.x;
+      pc.y += cand.newCenter.y;
+    }
+    if (pp && pp.t === 'pt' && pp.free) {
+      pp.x += cand.newCenter.x;
+      pp.y += cand.newCenter.y;
+    }
+    recalc(objs);
+    return;
+  }
+
+  if ((cand.kind === 'ln-ci' || cand.kind === 'ln-pg') && first.t === 'ln') {
     if (cand.anchorEnd && first.a !== undefined && first.b !== undefined) {
       const movingId = cand.anchorEnd === 'a' ? first.b : first.a;
       const pm = getObj(objs, movingId);
       if (pm && pm.t === 'pt' && pm.free) {
-        pm.x = cand.contact.x;
-        pm.y = cand.contact.y;
+        if (cand.kind === 'ln-pg' && cand.previewCurve.t === 'l') {
+          const pr = projectOnCurve(cand.previewCurve, pm.x, pm.y);
+          if (pr.u > 0.15) {
+            pm.x = pr.x;
+            pm.y = pr.y;
+          } else {
+            pm.x = cand.contact.x;
+            pm.y = cand.contact.y;
+          }
+        } else {
+          pm.x = cand.contact.x;
+          pm.y = cand.contact.y;
+        }
         recalc(objs);
       }
     } else if (cand.newCenter && first.a !== undefined && first.b !== undefined) {
@@ -3022,16 +4011,18 @@ export function applyTangencyConnection(objs: GeomObj[], cand: TangencyCandidate
   const second = getObj(objs, cand.secondId);
   if (!first || !second || first.dead || second.dead) return;
 
-  if ((cand.kind === 'ci-ci' || cand.kind === 'ci-ln') && first.t === 'ci') {
+  if ((cand.kind === 'ci-ci' || cand.kind === 'ci-ln' || cand.kind === 'ci-pg') && first.t === 'ci') {
     // Upgrade circle that already has 1 tangent into a 2-tangent circle preserving its radius
     if (first.tan !== undefined && first.tanSet === undefined && cand.newCenter && cand.newRadius) {
       const sg1 = first.m === 1 || first.m === 2 ? -1 : 1;
       const sg2 = cand.m === 1 || cand.m === 2 ? -1 : 1;
       const oldC = first.c;
       const oldTan = first.tan;
+      const oldTanEdge = first.tanEdge;
       delete first.c;
       delete first.p;
       delete first.tan;
+      delete first.tanEdge;
       delete first.m;
       delete first.d1;
       delete first.d2;
@@ -3039,9 +4030,13 @@ export function applyTangencyConnection(objs: GeomObj[], cand: TangencyCandidate
       delete first.ang;
       delete first.sg;
       delete first.tan2;
+      delete first.tan2Edge;
       delete first.sg2;
       delete first.kk;
       first.tanSet = [oldTan, cand.secondId];
+      if (oldTanEdge !== undefined || cand.tanEdge !== undefined) {
+        first.tanEdges = [oldTanEdge ?? -1, cand.tanEdge ?? -1];
+      }
       first.tanSigns = [sg1, sg2];
       first.tanRef = { x: cand.newCenter.x, y: cand.newCenter.y, r: cand.newRadius };
       first.tanFixedR = true;
@@ -3084,15 +4079,19 @@ export function applyTangencyConnection(objs: GeomObj[], cand: TangencyCandidate
     delete first.ang;
     delete first.sg;
     delete first.tan2;
+    delete first.tan2Edge;
     delete first.sg2;
     delete first.kk;
     delete first.tanSet;
+    delete first.tanEdges;
     delete first.tanSigns;
     delete first.tanRef;
     delete first.tanFixedR;
 
     first.c = centerPtId;
     first.tan = cand.secondId;
+    if (cand.tanEdge !== undefined) first.tanEdge = cand.tanEdge;
+    else delete first.tanEdge;
     first.m = cand.m ?? 0;
 
     for (const rid of oldRefs) {
@@ -3109,6 +4108,49 @@ export function applyTangencyConnection(objs: GeomObj[], cand: TangencyCandidate
       addObj(objs, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci: first.id, tg: cand.secondId });
     }
     recalc(objs);
+    return;
+  }
+
+  if ((cand.kind === 'pg-ci' || cand.kind === 'pg-ln' || cand.kind === 'pg-pg') && first.t === 'pg' && cand.newCenter) {
+    const pc = getObj(objs, first.c);
+    const pp = getObj(objs, first.p);
+    if (pc && pc.t === 'pt' && pc.free) {
+      pc.x += cand.newCenter.x;
+      pc.y += cand.newCenter.y;
+    }
+    if (pp && pp.t === 'pt' && pp.free) {
+      pp.x += cand.newCenter.x;
+      pp.y += cand.newCenter.y;
+    }
+    recalc(objs);
+    return;
+  }
+
+  if (cand.kind === 'ln-pg' && first.t === 'ln' && second.t === 'pg') {
+    if (cand.anchorEnd && cand.tanEdge !== undefined && first.a !== undefined && first.b !== undefined) {
+      const movingId = cand.anchorEnd === 'a' ? first.b : first.a;
+      const pm = getObj(objs, movingId);
+      if (pm && pm.t === 'pt' && pm.free) {
+        pm.free = false;
+        pm.on = cand.secondId;
+        pm.u = cand.tanEdge;
+        recalc(objs);
+      }
+      return;
+    }
+    if (cand.newCenter && first.a !== undefined && first.b !== undefined) {
+      const pa = getObj(objs, first.a);
+      const pb = getObj(objs, first.b);
+      if (pa && pa.t === 'pt' && pa.free) {
+        pa.x += cand.newCenter.x;
+        pa.y += cand.newCenter.y;
+      }
+      if (pb && pb.t === 'pt' && pb.free) {
+        pb.x += cand.newCenter.x;
+        pb.y += cand.newCenter.y;
+      }
+      recalc(objs);
+    }
     return;
   }
 
@@ -3275,6 +4317,16 @@ export function getCircleEditInfo(
   const cInfo = getTangentConstraintInfo(objs, circleId);
   const canSlideTan2 = !!(o.tanSet && o.tanSet.length === 2);
 
+  if (o.scaleLocked) {
+    return {
+      canResize: false,
+      canSlideTan2,
+      parentIds: cInfo.parentIds,
+      constraintCount: cInfo.constraintCount,
+      isLocked: cInfo.isLocked,
+    };
+  }
+
   let canResize = false;
   let isTanOffset = false;
   let hasFreeEdgePt = false;
@@ -3377,6 +4429,9 @@ export function releaseTangency(
     if (o.tanSet && o.tanSet.length >= 2) {
       if (mode === 'one' && o.tanSet.length >= 3) {
         const removedId = o.tanSet.pop()!;
+        if (o.tanEdges && o.tanEdges.length > o.tanSet.length) {
+          o.tanEdges.pop();
+        }
         if (o.tanSigns && o.tanSigns.length > o.tanSet.length) {
           o.tanSigns.pop();
         }
@@ -3393,6 +4448,7 @@ export function releaseTangency(
 
       if (mode === 'one' && o.tanSet.length === 2) {
         const keptId = o.tanSet[0];
+        const keptEdge = o.tanEdges?.[0];
         const removedId = o.tanSet[1];
         const T = curve(next, getObj(next, keptId));
         let m = 0;
@@ -3411,11 +4467,14 @@ export function releaseTangency(
         }
         const cId = addObj(next, { t: 'pt', free: true, x: C.x, y: C.y });
         delete o.tanSet;
+        delete o.tanEdges;
         delete o.tanSigns;
         delete o.tanRef;
         delete o.tanFixedR;
         o.c = cId;
         o.tan = keptId;
+        if (keptEdge !== undefined && keptEdge >= 0) o.tanEdge = keptEdge;
+        else delete o.tanEdge;
         o.m = m;
         for (const q of next) {
           if (!q.dead && q.t === 'pt' && q.tp && q.ci === o.id && q.tg === removedId) {
@@ -3430,6 +4489,7 @@ export function releaseTangency(
       const cId = addObj(next, { t: 'pt', free: true, x: C.x, y: C.y });
       const pId = addObj(next, { t: 'pt', free: true, x: C.x + C.r, y: C.y });
       delete o.tanSet;
+      delete o.tanEdges;
       delete o.tanSigns;
       delete o.tanRef;
       delete o.tanFixedR;
@@ -3449,6 +4509,7 @@ export function releaseTangency(
         const pe = getObj(next, o.e);
         const removedId = o.tan2;
         delete o.tan2;
+        delete o.tan2Edge;
         delete o.sg2;
         delete o.kk;
         if (pe && pe.t === 'pt' && pe.ok) {
@@ -3470,11 +4531,13 @@ export function releaseTangency(
       }
       const pId = addObj(next, { t: 'pt', free: true, x: C.x + C.r, y: C.y });
       delete o.tan;
+      delete o.tanEdge;
       delete o.m;
       delete o.e;
       delete o.ang;
       delete o.sg;
       delete o.tan2;
+      delete o.tan2Edge;
       delete o.sg2;
       delete o.kk;
       o.c = cId;
@@ -3548,5 +4611,633 @@ export function releaseTangency(
 
   return { ok: false };
 }
+
+export interface GeomBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  cx: number;
+  cy: number;
+  width: number;
+  height: number;
+}
+
+export function getObjBounds(
+  objs: GeomObj[],
+  id: number,
+  curveCache?: Array<Curve | null>
+): GeomBounds | null {
+  const o = getObj(objs, id);
+  if (!o || o.dead) return null;
+  if (o.t === 'pt') {
+    if (!o.ok) return null;
+    return {
+      minX: o.x,
+      minY: o.y,
+      maxX: o.x,
+      maxY: o.y,
+      cx: o.x,
+      cy: o.y,
+      width: 0,
+      height: 0,
+    };
+  }
+  const cv = curve(objs, o, curveCache);
+  if (!cv) return null;
+  if (cv.t === 'c') {
+    return {
+      minX: cv.x - cv.r,
+      minY: cv.y - cv.r,
+      maxX: cv.x + cv.r,
+      maxY: cv.y + cv.r,
+      cx: cv.x,
+      cy: cv.y,
+      width: cv.r * 2,
+      height: cv.r * 2,
+    };
+  }
+  if (cv.t === 'p') {
+    let minX = 1e18;
+    let minY = 1e18;
+    let maxX = -1e18;
+    let maxY = -1e18;
+    for (const v of cv.verts) {
+      if (v.x < minX) minX = v.x;
+      if (v.y < minY) minY = v.y;
+      if (v.x > maxX) maxX = v.x;
+      if (v.y > maxY) maxY = v.y;
+    }
+    if (minX > maxX) return null;
+    return {
+      minX,
+      minY,
+      maxX,
+      maxY,
+      cx: (minX + maxX) * 0.5,
+      cy: (minY + maxY) * 0.5,
+      width: maxX - minX,
+      height: maxY - minY,
+    };
+  }
+  if (o.t === 'ln' && o.a !== undefined && o.b !== undefined) {
+    const pa = getObj(objs, o.a);
+    const pb = getObj(objs, o.b);
+    if (pa && pa.t === 'pt' && pa.ok && pb && pb.t === 'pt' && pb.ok) {
+      const minX = Math.min(pa.x, pb.x);
+      const minY = Math.min(pa.y, pb.y);
+      const maxX = Math.max(pa.x, pb.x);
+      const maxY = Math.max(pa.y, pb.y);
+      return {
+        minX,
+        minY,
+        maxX,
+        maxY,
+        cx: (minX + maxX) * 0.5,
+        cy: (minY + maxY) * 0.5,
+        width: maxX - minX,
+        height: maxY - minY,
+      };
+    }
+  }
+  return {
+    minX: cv.x,
+    minY: cv.y,
+    maxX: cv.x,
+    maxY: cv.y,
+    cx: cv.x,
+    cy: cv.y,
+    width: 0,
+    height: 0,
+  };
+}
+
+function mergeBounds(list: GeomBounds[]): GeomBounds | null {
+  if (list.length === 0) return null;
+  let minX = 1e18;
+  let minY = 1e18;
+  let maxX = -1e18;
+  let maxY = -1e18;
+  for (const b of list) {
+    if (b.minX < minX) minX = b.minX;
+    if (b.minY < minY) minY = b.minY;
+    if (b.maxX > maxX) maxX = b.maxX;
+    if (b.maxY > maxY) maxY = b.maxY;
+  }
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    cx: (minX + maxX) * 0.5,
+    cy: (minY + maxY) * 0.5,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+export function getSelectionBoundingBox(
+  objs: GeomObj[],
+  ids: Set<number>,
+  curveCache?: Array<Curve | null>
+): GeomBounds | null {
+  if (ids.size === 0) return null;
+  const list: GeomBounds[] = [];
+  for (const id of ids) {
+    const o = getObj(objs, id);
+    if (!o || o.dead) continue;
+    const b = getObjBounds(objs, id, curveCache);
+    if (b) list.push(b);
+  }
+  return mergeBounds(list);
+}
+
+interface LayoutUnit {
+  key: string;
+  objIds: Set<number>;
+  bounds: GeomBounds;
+}
+
+function buildLayoutUnits(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  curveCache?: Array<Curve | null>
+): LayoutUnit[] {
+  const cache = curveCache ?? buildCurveCache(objs);
+  const ownedPtIds = new Set<number>();
+  const selectedCurves: GeomObj[] = [];
+
+  for (const id of selectedIds) {
+    const o = getObj(objs, id);
+    if (!o || o.dead) continue;
+    if (o.t !== 'pt') {
+      selectedCurves.push(o);
+      for (const r of refsOf(o)) {
+        const ro = getObj(objs, r);
+        if (ro && !ro.dead && ro.t === 'pt') ownedPtIds.add(r);
+      }
+    }
+  }
+
+  const primaryObjs: GeomObj[] = [...selectedCurves];
+  for (const id of selectedIds) {
+    const o = getObj(objs, id);
+    if (!o || o.dead || o.t !== 'pt' || !o.ok) continue;
+    if (!ownedPtIds.has(o.id)) {
+      primaryObjs.push(o);
+    }
+  }
+
+  const groupUnits = new Map<string, { objIds: Set<number>; boundsList: GeomBounds[] }>();
+  const standaloneUnits: LayoutUnit[] = [];
+
+  for (const o of primaryObjs) {
+    const b = getObjBounds(objs, o.id, cache);
+    if (!b) continue;
+    if (o.groupId) {
+      let bucket = groupUnits.get(o.groupId);
+      if (!bucket) {
+        bucket = { objIds: new Set<number>(), boundsList: [] };
+        groupUnits.set(o.groupId, bucket);
+      }
+      bucket.objIds.add(o.id);
+      bucket.boundsList.push(b);
+    } else {
+      standaloneUnits.push({
+        key: `obj-${o.id}`,
+        objIds: new Set<number>([o.id]),
+        bounds: b,
+      });
+    }
+  }
+
+  const out: LayoutUnit[] = [...standaloneUnits];
+  for (const [gid, bucket] of groupUnits.entries()) {
+    const merged = mergeBounds(bucket.boundsList);
+    if (merged) {
+      out.push({ key: `grp-${gid}`, objIds: bucket.objIds, bounds: merged });
+    }
+  }
+  return out;
+}
+
+export function getAlignUnitCount(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  curveCache?: Array<Curve | null>
+): number {
+  return buildLayoutUnits(objs, selectedIds, curveCache).length;
+}
+
+function translateUnitInPlace(
+  next: GeomObj[],
+  unitObjIds: Set<number>,
+  dx: number,
+  dy: number,
+  movedPts: Set<number>,
+  isObjLocked?: (objs: GeomObj[], id: number) => boolean
+): boolean {
+  if (Math.hypot(dx, dy) < 1e-6) return false;
+  let changed = false;
+  const ptIds = movableRootPointsForSelection(next, unitObjIds);
+  for (const pid of ptIds) {
+    if (movedPts.has(pid)) continue;
+    if (isObjLocked && isObjLocked(next, pid)) continue;
+    const pt = getObj(next, pid);
+    if (pt && pt.t === 'pt' && pt.free) {
+      pt.x += dx;
+      pt.y += dy;
+      movedPts.add(pid);
+      changed = true;
+    }
+  }
+  for (const oid of unitObjIds) {
+    if (isObjLocked && isObjLocked(next, oid)) continue;
+    const o = getObj(next, oid);
+    if (o && !o.dead && o.t === 'ci' && o.tanRef && o.tanSet && o.tanSet.length >= 2) {
+      o.tanRef = { x: o.tanRef.x + dx, y: o.tanRef.y + dy, r: o.tanRef.r };
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+export function alignObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  mode: AlignMode,
+  isObjLocked?: (objs: GeomObj[], id: number) => boolean
+): { ok: boolean; next?: GeomObj[] } {
+  const units = buildLayoutUnits(objs, selectedIds);
+  if (units.length < 2) return { ok: false };
+  const global = mergeBounds(units.map((u) => u.bounds));
+  if (!global) return { ok: false };
+
+  const next = cloneObjs(objs);
+  const movedPts = new Set<number>();
+  let anyChanged = false;
+
+  for (const u of units) {
+    let dx = 0;
+    let dy = 0;
+    if (mode === 'left') dx = global.minX - u.bounds.minX;
+    else if (mode === 'centerX') dx = global.cx - u.bounds.cx;
+    else if (mode === 'right') dx = global.maxX - u.bounds.maxX;
+    else if (mode === 'top') dy = global.minY - u.bounds.minY;
+    else if (mode === 'middleY') dy = global.cy - u.bounds.cy;
+    else if (mode === 'bottom') dy = global.maxY - u.bounds.maxY;
+
+    if (translateUnitInPlace(next, u.objIds, dx, dy, movedPts, isObjLocked)) {
+      anyChanged = true;
+    }
+  }
+
+  if (!anyChanged) return { ok: false };
+  recalc(next);
+  return { ok: true, next };
+}
+
+export function distributeObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  axis: DistributeAxis,
+  isObjLocked?: (objs: GeomObj[], id: number) => boolean
+): { ok: boolean; next?: GeomObj[] } {
+  const units = buildLayoutUnits(objs, selectedIds);
+  if (units.length < 3) return { ok: false };
+
+  const sorted = [...units].sort((a, b) =>
+    axis === 'horiz'
+      ? a.bounds.cx - b.bounds.cx || a.bounds.minX - b.bounds.minX
+      : a.bounds.cy - b.bounds.cy || a.bounds.minY - b.bounds.minY
+  );
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const next = cloneObjs(objs);
+  const movedPts = new Set<number>();
+  let anyChanged = false;
+
+  if (axis === 'horiz') {
+    const totalSpan = last.bounds.maxX - first.bounds.minX;
+    const sumW = sorted.reduce((acc, u) => acc + u.bounds.width, 0);
+    if (totalSpan >= sumW - 1e-6) {
+      const gap = (totalSpan - sumW) / (sorted.length - 1);
+      let cursor = first.bounds.maxX + gap;
+      for (let i = 1; i < sorted.length - 1; i++) {
+        const u = sorted[i];
+        const dx = cursor - u.bounds.minX;
+        if (translateUnitInPlace(next, u.objIds, dx, 0, movedPts, isObjLocked)) {
+          anyChanged = true;
+        }
+        cursor += u.bounds.width + gap;
+      }
+    } else {
+      const step = (last.bounds.cx - first.bounds.cx) / (sorted.length - 1);
+      for (let i = 1; i < sorted.length - 1; i++) {
+        const u = sorted[i];
+        const targetCx = first.bounds.cx + i * step;
+        if (translateUnitInPlace(next, u.objIds, targetCx - u.bounds.cx, 0, movedPts, isObjLocked)) {
+          anyChanged = true;
+        }
+      }
+    }
+  } else {
+    const totalSpan = last.bounds.maxY - first.bounds.minY;
+    const sumH = sorted.reduce((acc, u) => acc + u.bounds.height, 0);
+    if (totalSpan >= sumH - 1e-6) {
+      const gap = (totalSpan - sumH) / (sorted.length - 1);
+      let cursor = first.bounds.maxY + gap;
+      for (let i = 1; i < sorted.length - 1; i++) {
+        const u = sorted[i];
+        const dy = cursor - u.bounds.minY;
+        if (translateUnitInPlace(next, u.objIds, 0, dy, movedPts, isObjLocked)) {
+          anyChanged = true;
+        }
+        cursor += u.bounds.height + gap;
+      }
+    } else {
+      const step = (last.bounds.cy - first.bounds.cy) / (sorted.length - 1);
+      for (let i = 1; i < sorted.length - 1; i++) {
+        const u = sorted[i];
+        const targetCy = first.bounds.cy + i * step;
+        if (translateUnitInPlace(next, u.objIds, 0, targetCy - u.bounds.cy, movedPts, isObjLocked)) {
+          anyChanged = true;
+        }
+      }
+    }
+  }
+
+  if (!anyChanged) return { ok: false };
+  recalc(next);
+  return { ok: true, next };
+}
+
+export function groupObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  groupId: string
+): { ok: boolean; next?: GeomObj[]; groupedIds?: number[] } {
+  const units = buildLayoutUnits(objs, selectedIds);
+  if (units.length < 2) return { ok: false };
+  const next = cloneObjs(objs);
+  const groupedSet = new Set<number>();
+  for (const id of selectedIds) {
+    const o = getObj(next, id);
+    if (!o || o.dead) continue;
+    o.groupId = groupId;
+    groupedSet.add(o.id);
+    if (o.t !== 'pt') {
+      for (const r of refsOf(o)) {
+        const ro = getObj(next, r);
+        if (ro && !ro.dead && ro.t === 'pt') {
+          const usedOutside = next.some(
+            (q) => !q.dead && q.t !== 'pt' && !selectedIds.has(q.id) && refsOf(q).includes(ro.id)
+          );
+          if (!usedOutside) {
+            ro.groupId = groupId;
+            groupedSet.add(ro.id);
+          }
+        }
+      }
+    }
+  }
+  return groupedSet.size >= 2 ? { ok: true, next, groupedIds: Array.from(groupedSet) } : { ok: false };
+}
+
+export function ungroupObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>
+): { ok: boolean; next?: GeomObj[] } {
+  const targetGroups = new Set<string>();
+  let anyGroup = false;
+  for (const id of selectedIds) {
+    const o = getObj(objs, id);
+    if (o && !o.dead && o.groupId) {
+      targetGroups.add(o.groupId);
+      anyGroup = true;
+    }
+  }
+  if (!anyGroup) return { ok: false };
+  const next = cloneObjs(objs);
+  for (const o of next) {
+    if (!o.dead && o.groupId && (selectedIds.has(o.id) || targetGroups.has(o.groupId))) {
+      delete o.groupId;
+    }
+  }
+  return { ok: true, next };
+}
+
+export function findSmartAlignSnap(
+  objs: GeomObj[],
+  movingCurveIds: Set<number>,
+  movedBounds: GeomBounds,
+  viewK: number,
+  snapPx: number,
+  allowedIds?: Set<number>,
+  curveCache?: Array<Curve | null>
+): { dx: number; dy: number; guides: SmartGuide[] } {
+  const cache = curveCache ?? buildCurveCache(objs);
+  const tol = Math.min(8, Math.max(4, snapPx * 0.6)) / viewK;
+  const srcX = [movedBounds.minX, movedBounds.cx, movedBounds.maxX];
+  const srcY = [movedBounds.minY, movedBounds.cy, movedBounds.maxY];
+
+  const staticBounds: GeomBounds[] = [];
+  for (const o of objs) {
+    if (o.dead || movingCurveIds.has(o.id) || (o.t !== 'ci' && o.t !== 'pg' && o.t !== 'ln')) {
+      continue;
+    }
+    if (allowedIds && !allowedIds.has(o.id)) continue;
+    const b = getObjBounds(objs, o.id, cache);
+    if (!b || (b.width <= 1e-6 && b.height <= 1e-6)) continue;
+    staticBounds.push(b);
+  }
+  if (staticBounds.length === 0) return { dx: 0, dy: 0, guides: [] };
+
+  let bestDx = 0;
+  let bestDistX = tol;
+  let foundX = false;
+  for (const b of staticBounds) {
+    const tgtX = [b.minX, b.cx, b.maxX];
+    for (const sx of srcX) {
+      for (const tx of tgtX) {
+        const diff = tx - sx;
+        const ad = Math.abs(diff);
+        if (ad <= bestDistX) {
+          bestDistX = ad;
+          bestDx = diff;
+          foundX = true;
+        }
+      }
+    }
+  }
+
+  let bestDy = 0;
+  let bestDistY = tol;
+  let foundY = false;
+  for (const b of staticBounds) {
+    const tgtY = [b.minY, b.cy, b.maxY];
+    for (const sy of srcY) {
+      for (const ty of tgtY) {
+        const diff = ty - sy;
+        const ad = Math.abs(diff);
+        if (ad <= bestDistY) {
+          bestDistY = ad;
+          bestDy = diff;
+          foundY = true;
+        }
+      }
+    }
+  }
+
+  const guides: SmartGuide[] = [];
+  const pad = 14 / viewK;
+  const eps = 1e-3 / viewK;
+
+  if (foundX) {
+    const nextSrcX = srcX.map((v) => v + bestDx);
+    const seenX = new Set<number>();
+    for (const b of staticBounds) {
+      for (const tx of [b.minX, b.cx, b.maxX]) {
+        if (nextSrcX.some((sx) => Math.abs(sx - tx) <= eps)) {
+          const key = Math.round(tx * 100);
+          if (!seenX.has(key)) {
+            seenX.add(key);
+            guides.push({
+              axis: 'x',
+              x1: tx,
+              y1: Math.min(movedBounds.minY + (foundY ? bestDy : 0), b.minY) - pad,
+              x2: tx,
+              y2: Math.max(movedBounds.maxY + (foundY ? bestDy : 0), b.maxY) + pad,
+            });
+          }
+          if (guides.length >= 2) break;
+        }
+      }
+      if (guides.length >= 2) break;
+    }
+  }
+
+  if (foundY) {
+    const nextSrcY = srcY.map((v) => v + bestDy);
+    const seenY = new Set<number>();
+    let countY = 0;
+    for (const b of staticBounds) {
+      for (const ty of [b.minY, b.cy, b.maxY]) {
+        if (nextSrcY.some((sy) => Math.abs(sy - ty) <= eps)) {
+          const key = Math.round(ty * 100);
+          if (!seenY.has(key)) {
+            seenY.add(key);
+            guides.push({
+              axis: 'y',
+              x1: Math.min(movedBounds.minX + (foundX ? bestDx : 0), b.minX) - pad,
+              y1: ty,
+              x2: Math.max(movedBounds.maxX + (foundX ? bestDx : 0), b.maxX) + pad,
+              y2: ty,
+            });
+            countY++;
+          }
+          if (countY >= 2) break;
+        }
+      }
+      if (countY >= 2) break;
+    }
+  }
+
+  return {
+    dx: foundX ? bestDx : 0,
+    dy: foundY ? bestDy : 0,
+    guides,
+  };
+}
+
+export function mirrorObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  axis: MirrorAxis,
+  targetPhaseId?: string
+): { ok: boolean; next?: GeomObj[]; createdIds?: number[] } {
+  const bounds = getSelectionBoundingBox(objs, selectedIds);
+  const sub = buildCopySubgraph(objs, selectedIds);
+  if (!bounds || !sub) return { ok: false };
+
+  const reflectX = (x: number) => (axis === 'h' ? 2 * bounds.cx - x : x);
+  const reflectY = (y: number) => (axis === 'v' ? 2 * bounds.cy - y : y);
+
+  for (const item of sub.items) {
+    if (item.t === 'pt' && item.free) {
+      item.x = reflectX(item.x);
+      item.y = reflectY(item.y);
+    } else if (item.t === 'ln') {
+      if (item.s !== undefined) item.s = -item.s;
+    } else if (item.t === 'ci') {
+      if (item.tanRef) {
+        item.tanRef = {
+          x: reflectX(item.tanRef.x),
+          y: reflectY(item.tanRef.y),
+          r: item.tanRef.r,
+        };
+      }
+      if (item.ang !== undefined) {
+        item.ang = axis === 'h' ? Math.PI - item.ang : -item.ang;
+      }
+      if (item.sg !== undefined) item.sg = -item.sg;
+      if (item.sg2 !== undefined) item.sg2 = -item.sg2;
+    }
+  }
+
+  recalc(sub.items);
+  const { next, pastedIds } = pasteSubgraph(objs, sub, 0, 0, targetPhaseId);
+  return pastedIds.length > 0 ? { ok: true, next, createdIds: pastedIds } : { ok: false };
+}
+
+export function radialArrayObjects(
+  objs: GeomObj[],
+  selectedIds: Set<number>,
+  count: number,
+  pivot: { x: number; y: number },
+  targetPhaseId?: string
+): { ok: boolean; next?: GeomObj[]; createdIds?: number[] } {
+  if (count < 2 || selectedIds.size === 0) return { ok: false };
+
+  let curNext = cloneObjs(objs);
+  const createdIds: number[] = [];
+
+  for (let i = 1; i < count; i++) {
+    const theta = (i * Math.PI * 2) / count;
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    const rotPt = (x: number, y: number): [number, number] => {
+      const dx = x - pivot.x;
+      const dy = y - pivot.y;
+      return [pivot.x + dx * cos - dy * sin, pivot.y + dx * sin + dy * cos];
+    };
+
+    const sub = buildCopySubgraph(objs, selectedIds);
+    if (!sub) return { ok: false };
+    for (const item of sub.items) {
+      if (item.t === 'pt' && item.free) {
+        const [rx, ry] = rotPt(item.x, item.y);
+        item.x = rx;
+        item.y = ry;
+      } else if (item.t === 'ci') {
+        if (item.tanRef) {
+          const [rx, ry] = rotPt(item.tanRef.x, item.tanRef.y);
+          item.tanRef = { x: rx, y: ry, r: item.tanRef.r };
+        }
+        if (item.ang !== undefined) {
+          item.ang += theta;
+        }
+      }
+    }
+    recalc(sub.items);
+    const { next, pastedIds } = pasteSubgraph(curNext, sub, 0, 0, targetPhaseId);
+    curNext = next;
+    createdIds.push(...pastedIds);
+  }
+
+  return createdIds.length > 0 ? { ok: true, next: curNext, createdIds } : { ok: false };
+}
+
+
 
 

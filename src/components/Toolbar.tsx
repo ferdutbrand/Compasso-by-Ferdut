@@ -1,14 +1,15 @@
-import React, { useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  ChevronDown,
   Circle,
   Combine,
   Compass,
   Crosshair,
   Download,
   Eraser,
+  Grid3X3,
   HelpCircle,
   ImagePlus,
-  Lock,
   Magnet,
   Minus,
   Moon,
@@ -17,38 +18,39 @@ import {
   Redo2,
   Ruler,
   Shapes,
+  Square,
   Star,
   Sun,
-  Target,
   Trash2,
   Undo2,
-  Unlock,
-  Waypoints,
 } from 'lucide-react';
-import type { DimMode, ToolId } from '../geometry/types';
-import { modKey } from '../geometry/types';
+import type { GridConfig } from '../geometry/grid';
+import type { DimMode, SvgExportLayers, ToolId } from '../geometry/types';
+import { modKey, optKey } from '../geometry/types';
 
 interface ToolbarProps {
   tool: ToolId;
   onSelectTool: (t: ToolId) => void;
-  tgActive: boolean;
-  shiftDown: boolean;
-  onToggleTg: () => void;
   prioMode: boolean;
   backquoteDown: boolean;
   onTogglePrioMode: () => void;
   snapEnabled: boolean;
   onToggleSnap: () => void;
+  tanSnapEnabled: boolean;
+  onToggleTanSnap: () => void;
   snapPx: number;
   onChangeSnapPx: (px: number) => void;
   showRulers: boolean;
   onToggleRulers: () => void;
-  guidesLocked: boolean;
-  onToggleGuidesLocked: () => void;
+  gridConfig: GridConfig;
+  showGridPanel: boolean;
+  onToggleGridPanel: () => void;
   dimMode: DimMode;
   onCycleDimMode: () => void;
   svgOverlap: boolean;
   onToggleSvgOverlap: () => void;
+  svgExportLayers: SvgExportLayers;
+  onChangeSvgExportLayers: (layers: SvgExportLayers) => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -76,9 +78,7 @@ const TOOLS: Array<{
   { id: 'move', label: 'Mover', shortcut: 'V', icon: MousePointer2 },
   { id: 'ln', label: 'Reta', shortcut: 'L', icon: Minus },
   { id: 'ci', label: 'Círculo', shortcut: 'C', icon: Circle },
-  { id: 'cb', label: 'Borda', shortcut: 'B', icon: Compass },
-  { id: 'tc', label: 'Tang. comum', shortcut: 'T', icon: Waypoints },
-  { id: 'tcir', label: 'Círc. tang.', shortcut: 'A', icon: Target },
+  { id: 'pg', label: 'Polígono', shortcut: 'Q', icon: Square },
   { id: 'shape', label: 'Construtor', shortcut: 'F', icon: Combine },
   { id: 'ruler', label: 'Régua', shortcut: 'U', icon: Ruler },
   { id: 'del', label: 'Apagar', shortcut: 'X', icon: Eraser },
@@ -87,24 +87,26 @@ const TOOLS: Array<{
 export const Toolbar: React.FC<ToolbarProps> = ({
   tool,
   onSelectTool,
-  tgActive,
-  shiftDown,
-  onToggleTg,
   prioMode,
   backquoteDown,
   onTogglePrioMode,
   snapEnabled,
   onToggleSnap,
+  tanSnapEnabled,
+  onToggleTanSnap,
   snapPx,
   onChangeSnapPx,
   showRulers,
   onToggleRulers,
-  guidesLocked,
-  onToggleGuidesLocked,
+  gridConfig,
+  showGridPanel,
+  onToggleGridPanel,
   dimMode,
   onCycleDimMode,
   svgOverlap,
   onToggleSvgOverlap,
+  svgExportLayers,
+  onChangeSvgExportLayers,
   canUndo,
   canRedo,
   onUndo,
@@ -123,13 +125,32 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   onToggleHelp,
 }) => {
   const fileRef = useRef<HTMLInputElement>(null);
-  const tgOn = tgActive || shiftDown;
-  const prioOn = prioMode || backquoteDown;
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+  const [exportOpen, setExportOpen] = useState(false);
 
+  const prioOn = prioMode || backquoteDown;
   const dimLabel = dimMode === 'd' ? 'Ø Dim' : dimMode === 'r' ? 'r Dim' : 'Dim off';
 
+  useEffect(() => {
+    if (!exportOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setExportOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setExportOpen(false);
+    };
+    window.addEventListener('pointerdown', onDown);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('pointerdown', onDown);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [exportOpen]);
+
   return (
-    <header className="shrink-0 border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-900 px-3 py-2 flex flex-wrap items-center gap-x-2.5 gap-y-2 select-none">
+    <header className="relative z-30 shrink-0 border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-900 px-3 py-2 flex flex-wrap items-center gap-x-2.5 gap-y-2 select-none">
       {/* Brand mark */}
       <div className="flex items-center gap-2 pr-2 border-r border-slate-200 dark:border-zinc-800 shrink-0">
         <Compass className="w-5 h-5 text-blue-600 dark:text-blue-400" aria-hidden="true" />
@@ -138,10 +159,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         </span>
       </div>
 
-      {/* Primary construction tools */}
-      <nav aria-label="Ferramentas de construção" className="flex items-center gap-1 flex-wrap">
+      {/* Primary consolidated construction tools (icon-only with tooltips) */}
+      <nav aria-label="Ferramentas de construção" className="flex items-center gap-1">
         {TOOLS.map(({ id, label, shortcut, icon: Icon }) => {
           const active = tool === id;
+          const isCircle = id === 'ci';
           return (
             <button
               key={id}
@@ -149,52 +171,24 @@ export const Toolbar: React.FC<ToolbarProps> = ({
               onClick={() => onSelectTool(id)}
               title={`${label} (${shortcut})`}
               aria-pressed={active}
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
+              className={`relative p-2 rounded-lg border transition-all duration-150 shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
                 active
                   ? id === 'del'
-                    ? 'bg-rose-600 border-rose-600 text-white'
-                    : 'bg-blue-600 border-blue-600 text-white'
+                    ? 'bg-rose-600 border-rose-600 text-white shadow-sm'
+                    : 'bg-blue-600 border-blue-600 text-white shadow-sm'
                   : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
               }`}
             >
-              <Icon className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-              <span>{label}</span>
-              <kbd
-                className={`text-[10px] font-mono px-1 rounded ${
-                  active
-                    ? 'bg-white/20 text-white'
-                    : 'bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400'
-                }`}
-              >
-                {shortcut}
-              </kbd>
+              <Icon className="w-4 h-4 shrink-0" aria-hidden="true" />
+              {isCircle && (
+                <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+                </span>
+              )}
             </button>
           );
         })}
-
-        {/* Tangency mode toggle */}
-        <button
-          type="button"
-          onClick={onToggleTg}
-          title="Modo Tangente (S ou segure Shift)"
-          aria-pressed={tgOn}
-          className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
-            tgOn
-              ? 'bg-blue-600 border-blue-600 text-white'
-              : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
-          }`}
-        >
-          <span>Tangente</span>
-          <kbd
-            className={`text-[10px] font-mono px-1 rounded ${
-              tgOn
-                ? 'bg-white/20 text-white'
-                : 'bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400'
-            }`}
-          >
-            S
-          </kbd>
-        </button>
 
         {/* Priority mode toggle */}
         <button
@@ -202,32 +196,22 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           onClick={onTogglePrioMode}
           title="Priorizar objetos: segure ` + clique (ou ative este modo e clique nos objetos)"
           aria-pressed={prioOn}
-          className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 ${
+          className={`p-2 rounded-lg border transition-all duration-150 shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 ${
             prioOn
-              ? 'bg-amber-500 border-amber-500 text-white'
+              ? 'bg-amber-500 border-amber-500 text-white shadow-sm'
               : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
           }`}
         >
-          <Star className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          <span>Prioridade</span>
-          <kbd
-            className={`text-[10px] font-mono px-1 rounded ${
-              prioOn
-                ? 'bg-white/20 text-white'
-                : 'bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400'
-            }`}
-          >
-            `
-          </kbd>
+          <Star className="w-4 h-4 shrink-0" aria-hidden="true" />
         </button>
       </nav>
 
-      {/* Snap, Rulers, Guide Lock & Dimension controls */}
+      {/* Snap, Rulers, Grid & Dimension controls */}
       <div className="flex items-center gap-1.5 pl-2 border-l border-slate-200 dark:border-zinc-800 shrink-0">
         <button
           type="button"
           onClick={onToggleSnap}
-          title="Ativar/Desativar Snap (G) · Segure Alt para ignorar temporariamente"
+          title={`Ativar/Desativar Snap (G) · Segure ${optKey} para ignorar temporariamente`}
           aria-pressed={snapEnabled}
           className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
             snapEnabled
@@ -237,6 +221,28 @@ export const Toolbar: React.FC<ToolbarProps> = ({
         >
           <Magnet className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
           <span>Snap</span>
+        </button>
+        <button
+          type="button"
+          onClick={onToggleTanSnap}
+          title={`Ativar/Desativar Snap de Tangência (E) · ${tanSnapEnabled ? 'Ativo' : 'Desativado'}`}
+          aria-pressed={tanSnapEnabled}
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-600 ${
+            tanSnapEnabled
+              ? 'bg-violet-600 border-violet-600 text-white'
+              : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-500 dark:text-zinc-400 hover:bg-slate-100 dark:hover:bg-zinc-800'
+          }`}
+        >
+          <span>Snap tang.</span>
+          <kbd
+            className={`text-[10px] font-mono px-1 rounded ${
+              tanSnapEnabled
+                ? 'bg-white/20 text-white'
+                : 'bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400'
+            }`}
+          >
+            E
+          </kbd>
         </button>
         <div
           className={`inline-flex items-center rounded-md border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 overflow-hidden ${
@@ -284,27 +290,46 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
         <button
           type="button"
-          onClick={onToggleGuidesLocked}
-          title="Bloquear/Desbloquear guias (K)"
-          aria-pressed={guidesLocked}
+          onClick={onToggleGridPanel}
+          title="Configurar Grid de Trabalho e Regra de Tamanho (H)"
+          aria-expanded={showGridPanel}
           className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer ${
-            guidesLocked
-              ? 'bg-amber-600 border-amber-600 text-white'
+            showGridPanel || gridConfig.enabled || gridConfig.sizeRule !== 'free'
+              ? 'bg-emerald-600 border-emerald-600 text-white'
               : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
           }`}
         >
-          {guidesLocked ? (
-            <Lock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          ) : (
-            <Unlock className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          )}
-          <span>{guidesLocked ? 'Guias bloq.' : 'Guias livres'}</span>
+          <Grid3X3 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            {gridConfig.enabled
+              ? gridConfig.kind === 'fibonacci'
+                ? 'Grid Fib'
+                : gridConfig.kind === 'modular'
+                  ? 'Grid Mod'
+                  : gridConfig.kind === 'isometric'
+                    ? 'Grid Iso'
+                    : gridConfig.kind === 'phi'
+                      ? 'Grid φ'
+                      : 'Grid Polar'
+              : gridConfig.sizeRule !== 'free'
+                ? `Regra ${gridConfig.sizeRule === 'fibonacci' ? 'Fib' : gridConfig.sizeRule === 'golden' ? 'φ' : 'Mod'}`
+                : 'Grid'}
+          </span>
+          <kbd
+            className={`text-[10px] font-mono px-1 rounded ${
+              showGridPanel || gridConfig.enabled || gridConfig.sizeRule !== 'free'
+                ? 'bg-white/20 text-white'
+                : 'bg-slate-100 dark:bg-zinc-800 text-slate-500 dark:text-zinc-400'
+            }`}
+          >
+            H
+          </kbd>
         </button>
 
         <button
           type="button"
           onClick={onCycleDimMode}
-          title="Exibir dimensão no centro dos círculos (D): Diâmetro (Ø), Raio (r) ou Oculto"
+          title="Exibir dimensão no centro de círculos e polígonos (D): Diâmetro/Lado, Raio ou Oculto"
           aria-pressed={dimMode !== 'off'}
           className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer ${
             dimMode !== 'off'
@@ -319,7 +344,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
 
       <div className="flex-1 min-w-2" />
 
-      {/* History, Zoom, Image, Demo, Export */}
+      {/* History, Zoom, Image, Demo, Export Popover */}
       <div className="flex items-center gap-1.5 flex-wrap">
         <div className="flex items-center gap-1">
           <button
@@ -414,38 +439,102 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           <span>Limpar</span>
         </button>
 
-        {/* SVG Export + 0.05px vector overlap toggle */}
-        <div className="flex items-center gap-1 pl-1.5 border-l border-slate-200 dark:border-zinc-800">
+        {/* Consolidated Freeform-style SVG Export Popover */}
+        <div ref={exportMenuRef} className="relative pl-1.5 border-l border-slate-200 dark:border-zinc-800">
           <button
             type="button"
-            onClick={onToggleSvgOverlap}
-            title="Sobreposição vetorial no SVG exportado (+0,05 px nas tangências para eliminar gaps entre curvas)"
-            aria-pressed={svgOverlap}
-            className={`px-2 py-1.5 text-[11px] font-mono tabular-nums rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer ${
-              svgOverlap
-                ? 'bg-emerald-600 border-emerald-600 text-white'
-                : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-500 dark:text-zinc-400 hover:bg-slate-100 dark:hover:bg-zinc-800'
+            onClick={() => setExportOpen((p) => !p)}
+            aria-expanded={exportOpen}
+            title="Opções de exportação SVG em camadas"
+            className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors duration-150 whitespace-nowrap shrink-0 cursor-pointer ${
+              exportOpen
+                ? 'bg-slate-900 border-slate-900 text-white dark:bg-zinc-100 dark:border-zinc-100 dark:text-zinc-900'
+                : 'bg-white dark:bg-zinc-950 border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
             }`}
           >
-            {svgOverlap ? '+0,05px SVG' : '0px SVG'}
-          </button>
-          <button
-            type="button"
-            onClick={() => onExportSvg(true)}
-            title="Exportar SVG com fundo branco"
-            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0 cursor-pointer"
-          >
             <Download className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span>SVG</span>
+            <span>Exportar SVG</span>
+            <ChevronDown className="w-3 h-3 shrink-0 opacity-70" aria-hidden="true" />
           </button>
-          <button
-            type="button"
-            onClick={() => onExportSvg(false)}
-            title="Exportar SVG com fundo transparente"
-            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-md border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <span>SVG transp.</span>
-          </button>
+
+          {exportOpen && (
+            <div
+              role="dialog"
+              aria-label="Opções de exportação SVG"
+              className="absolute right-0 top-full mt-2 w-64 rounded-2xl border border-slate-200/90 dark:border-zinc-700 bg-slate-50/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-2xl p-3 space-y-2.5 text-xs text-slate-800 dark:text-zinc-100 z-40"
+            >
+              <div className="space-y-1">
+                <div className="text-[11px] font-medium text-slate-600 dark:text-zinc-300 px-0.5">
+                  Camadas
+                </div>
+                <div className="grid grid-cols-3 rounded-lg bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5">
+                  {(
+                    [
+                      { id: 'all', label: 'Tudo' },
+                      { id: 'paths', label: 'Só Paths' },
+                      { id: 'geometry', label: 'Construção' },
+                    ] as Array<{ id: SvgExportLayers; label: string }>
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => onChangeSvgExportLayers(opt.id)}
+                      aria-pressed={svgExportLayers === opt.id}
+                      className={`h-7 rounded text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                        svgExportLayers === opt.id
+                          ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                          : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <span className="text-[11px] font-medium text-slate-600 dark:text-zinc-300">
+                  Sobreposição tangencial
+                </span>
+                <button
+                  type="button"
+                  onClick={onToggleSvgOverlap}
+                  aria-pressed={svgOverlap}
+                  title="Adiciona +0,05 px nas tangências para evitar micro-gaps em softwares vetoriais"
+                  className={`px-2 py-1 rounded-full text-[11px] font-mono tabular-nums transition cursor-pointer ${
+                    svgOverlap
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-slate-200/80 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300'
+                  }`}
+                >
+                  {svgOverlap ? '+0,05 px' : '0 px'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onExportSvg(true);
+                    setExportOpen(false);
+                  }}
+                  className="h-8 rounded-lg bg-slate-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 font-medium whitespace-nowrap cursor-pointer"
+                >
+                  Fundo branco
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onExportSvg(false);
+                    setExportOpen(false);
+                  }}
+                  className="h-8 rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-700 font-medium whitespace-nowrap cursor-pointer"
+                >
+                  Transparente
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <button

@@ -8,6 +8,7 @@ import {
   DEFAULT_SVG_OVERLAP_PX,
   addObj,
   allInter,
+  alignObjects,
   applyDragTangencySnap,
   applyTangencyConnection,
   buildCopySubgraph,
@@ -21,22 +22,32 @@ import {
   descOf,
   distToCurve,
   distToGuide,
+  distributeObjects,
   findDragTangencySnap,
+  findSmartAlignSnap,
+  getAlignUnitCount,
   getCircleEditInfo,
   getObj,
+  getSelectionBoundingBox,
   getTangentConstraintInfo,
+  groupObjects,
   guideToCurve,
   isPrioritized,
   killObj,
   makeSVG,
+  mirrorObjects,
   movableRootPointsForSelection,
+  nearestPolyEdge,
   pasteSubgraph,
+  polyEdgeLine,
   projectOnCurve,
+  radialArrayObjects,
   recalc,
   refsOf,
   releaseTangency,
   safeSnap,
   setCircleRadius,
+  setPolygonSide,
   snap,
   solveMultiTangent,
   tanFields,
@@ -44,41 +55,59 @@ import {
   tanSolve,
   tangentFor,
   tangentLineFor,
+  ungroupObjects,
   type CircleEditInfo,
 } from './geometry/engine';
-import { buildPlanarArrangement } from './geometry/shapeBuilder';
+import {
+  DEFAULT_GRID_CONFIG,
+  computeFibonacciTiles,
+  snapSizeByRule,
+  snapToGrid,
+  type GridConfig,
+} from './geometry/grid';
+import { buildPlanarArrangement, combineClosedCurvesAsShape } from './geometry/shapeBuilder';
 import type {
+  AlignMode,
   BuiltShape,
+  CircleCurve,
+  CircleObj,
+  CircleToolMode,
+  CombineShapeOp,
   CopiedSubgraph,
+  CreationOrigin,
   Curve,
   DimMode,
+  DistributeAxis,
   EditState,
   GeomObj,
   GhostPreview,
   GuideLine,
   Guideline,
+  LineToolMode,
+  MirrorAxis,
   MultiTanSolution,
   Phase,
   PointObj,
+  PolyCurve,
   RefImage,
+  SmartGuide,
   SnapResult,
+  SvgExportLayers,
   TanTargetSel,
   TangencyCandidate,
   ToolId,
   ViewState,
 } from './geometry/types';
-import { modKey } from './geometry/types';
+import { delKey, modKey, optKey } from './geometry/types';
 
 const TOOL_MSGS: Record<ToolId, string> = {
-  move: 'Clique/arraste objetos (aproxime para pré-visualizar tangência roxa) ou Shift+clique em 2 objetos (1º→2º) e toque no ponto roxo para conectar.',
-  ln: 'Clique em 2 pontos para traçar a reta. Com Shift/Tangente no 2º clique: tangente ao círculo mais próximo (até 10px).',
-  ci: 'Clique no centro e depois na borda. Com Shift/Tangente no 2º clique: círculo tangente ao elemento mais próximo (até 10px).',
-  cb: 'Clique num ponto da borda e mova para definir o diâmetro. Com Shift/Tangente: tangente a até 2 curvas próximas (até 10px).',
-  tc: 'Clique em dois círculos e depois escolha uma das 4 tangentes comuns.',
-  tcir: 'Clique em 2 a 4 círculos/retas/pontos para construir um círculo tangente. Com 2+ selecionados, clique no vazio ou Enter para criar (Tab alterna variações).',
-  shape: 'Construtor de Forma (F): clique ou arraste sobre regiões fechadas para criar um path na fase ativa (sem cortar formas anteriores). Segure Alt para subtrair.',
-  ruler: 'Clique em 2 pontos para medir distância/ângulo e criar uma guia inclinada (snap até 10px), ou arraste das réguas superior/esquerda para guias H/V.',
-  del: 'Clique em um ponto, curva, forma construída ou guia (destravada) para apagá-lo.',
+  move: 'Arraste no vazio para seleção em caixa (Espaço+arrastar move a tela). Selecione 1+ objetos para alinhar/travar escala/espelhar ou Shift+clique em 2 para conectar tangência.',
+  ln: 'Reta (L): alterne entre Reta livre, Tangente (S) ou Tang. comum (T) na cápsula contextual.',
+  ci: 'Círculo (C): alterne entre Centro, Sup. esq., Borda/Diâm. (B) ou Círc. tang. (A) na cápsula contextual.',
+  pg: 'Quadrado/Polígono (Q): defina por Centro ou Sup. esq. na cápsula contextual. Shift fixa ângulos de 15° e Alt/⌥ ignora snap.',
+  shape: 'Construtor de Forma (F): clique ou arraste sobre regiões fechadas para criar um path na fase ativa. Segure Alt/⌥ para subtrair.',
+  ruler: 'Régua / Guia (U): clique em 2 pontos para medir distância/ângulo e criar guia inclinada, ou arraste das réguas superior/esquerda para guias H/V.',
+  del: 'Apagar (X): clique em um ponto, curva, polígono, forma construída ou guia destravada para apagá-lo.',
 };
 
 const INITIAL_PHASES: Phase[] = [
@@ -117,6 +146,7 @@ type HistorySnapshot = {
   phases: Phase[];
   activePhaseId: string;
   refImgs: RefImage[];
+  guides: GuideLine[];
 };
 
 type ConfirmDialogState =
@@ -153,6 +183,10 @@ function cloneRefImgs(imgs: RefImage[]): RefImage[] {
   return imgs.map((img) => ({ ...img }));
 }
 
+function cloneGuides(guides: GuideLine[]): GuideLine[] {
+  return guides.map((g) => ({ ...g }));
+}
+
 type ImgDragState =
   | { id: string; m: 'rot' }
   | { id: string; m: 'sc'; d0: number; w0: number; h0: number; cx: number; cy: number }
@@ -169,6 +203,13 @@ type DragState =
       modifiedCurveId?: number;
       fixedCenter?: boolean;
       anchorEnd?: 'a' | 'b';
+      pgCornerEdit?: {
+        polyId: number;
+        cx: number;
+        cy: number;
+        sides: number;
+        lockedRadius?: number;
+      };
     }
   | {
       kind: 'resize';
@@ -214,6 +255,7 @@ type GuideDragState = {
   sx: number;
   sy: number;
   orig: GuideLine;
+  saved: boolean;
 };
 
 function circleContactPoint(
@@ -222,14 +264,23 @@ function circleContactPoint(
   cy: number,
   r: number,
   targetId: number,
-  curveCache?: ReturnType<typeof buildCurveCache>
+  curveCache?: ReturnType<typeof buildCurveCache>,
+  edgeIdx?: number
 ): { x: number; y: number } | null {
   const T = curve(objs, getObj(objs, targetId), curveCache);
   if (!T) return null;
+  if (T.t === 'p') {
+    const edgeL =
+      edgeIdx !== undefined ? polyEdgeLine(T, edgeIdx) : nearestPolyEdge(T, cx, cy)?.line ?? null;
+    if (!edgeL) return null;
+    const p = projectOnCurve(edgeL, cx, cy);
+    return { x: p.x, y: p.y };
+  }
   if (T.t === 'l') {
     const p = projectOnCurve(T, cx, cy);
     return { x: p.x, y: p.y };
   }
+  if (T.t !== 'c') return null;
   const D = Math.hypot(cx - T.x, cy - T.y);
   if (D < 1e-9) return null;
   const dExt = Math.abs(D - (r + T.r));
@@ -297,11 +348,62 @@ function snapAxisCoordinate(
   return best;
 }
 
+function resolvePolyCorner(
+  cx: number,
+  cy: number,
+  hx: number,
+  hy: number,
+  isFreeSnap: boolean,
+  sides: number,
+  sh: boolean,
+  alt: boolean,
+  effSnap: boolean,
+  gCfg: GridConfig
+): { px: number; py: number; r: number; rot: number; side: number; tag: string | null } | null {
+  const dx = hx - cx;
+  const dy = hy - cy;
+  const rawR = Math.hypot(dx, dy);
+  if (rawR <= 1e-4) return null;
+  let rot = Math.atan2(dy, dx);
+  if (isFreeSnap && !alt) {
+    if (sh) {
+      const step = Math.PI / 12;
+      rot = Math.round(rot / step) * step;
+    } else if (effSnap && sides === 4) {
+      const step = Math.PI / 4;
+      const nearest = Math.round(rot / step) * step;
+      if (Math.abs(rot - nearest) < 0.22) {
+        rot = nearest;
+      }
+    }
+  }
+  const rawSide = 2 * rawR * Math.sin(Math.PI / sides);
+  let side = rawSide;
+  let r = rawR;
+  let tag: string | null = null;
+  if (isFreeSnap && !alt && gCfg.sizeRule !== 'free') {
+    const rule = snapSizeByRule(rawSide, gCfg);
+    side = rule.snapped;
+    r = side / (2 * Math.sin(Math.PI / sides));
+    tag = rule.tag;
+  }
+  return {
+    px: cx + r * Math.cos(rot),
+    py: cy + r * Math.sin(rot),
+    r,
+    rot,
+    side,
+    tag,
+  };
+}
+
 export default function App() {
   const svgRef = useRef<SVGSVGElement | null>(null);
 
   const [objs, setObjs] = useState<GeomObj[]>([]);
   const [tool, setTool] = useState<ToolId>('move');
+  const [lineMode, setLineMode] = useState<LineToolMode>('free');
+  const [circleMode, setCircleMode] = useState<CircleToolMode>('center');
   const [pend, setPend] = useState<number[]>([]);
   const [tcSel, setTcSel] = useState<number[]>([]);
   const [tanSel, setTanSel] = useState<TanTargetSel[]>([]);
@@ -309,12 +411,14 @@ export default function App() {
   const [tanVariantIdx, setTanVariantIdx] = useState(0);
   const [tanVariantCount, setTanVariantCount] = useState(0);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [selectedShapeIds, setSelectedShapeIds] = useState<Set<string>>(new Set());
   const [hoveredSelTanCand, setHoveredSelTanCand] = useState<TangencyCandidate | null>(null);
   const [hoveredResizeGrip, setHoveredResizeGrip] = useState(false);
   const [dragTanOverlay, setDragTanOverlay] = useState<{
     candidates: TangencyCandidate[];
     active: TangencyCandidate | null;
   } | null>(null);
+  const [smartGuides, setSmartGuides] = useState<SmartGuide[]>([]);
   const [prio, setPrio] = useState<Set<number>>(new Set());
   const [prioMode, setPrioMode] = useState(false);
   const [backquoteDown, setBackquoteDown] = useState(false);
@@ -327,9 +431,11 @@ export default function App() {
   const [altDown, setAltDown] = useState(false);
   const [spaceDown, setSpaceDown] = useState(false);
   const [snapEnabled, setSnapEnabled] = useState(true);
+  const [tanSnapEnabled, setTanSnapEnabled] = useState(true);
   const [snapPx, setSnapPx] = useState(DEFAULT_SNAP_PX);
   const [dimMode, setDimMode] = useState<DimMode>('d');
   const [svgOverlap, setSvgOverlap] = useState(true);
+  const [svgExportLayers, setSvgExportLayers] = useState<SvgExportLayers>('all');
   const [hasClipboard, setHasClipboard] = useState(false);
   const [view, setView] = useState<ViewState>({ x: 0, y: 0, k: 1 });
   const [size, setSize] = useState({ w: 1200, h: 720 });
@@ -353,10 +459,20 @@ export default function App() {
   const [rulerStart, setRulerStart] = useState<{ x: number; y: number } | null>(null);
   const [cursorWorld, setCursorWorld] = useState<{ x: number; y: number } | null>(null);
 
-  // Editable circle reference dimension
-  const [editingDim, setEditingDim] = useState<{ id: number; cx: number; cy: number; r: number } | null>(null);
+  // Editable circle / polygon reference dimension & Work Grids
+  const [editingDim, setEditingDim] = useState<{
+    id: number;
+    kind: 'ci' | 'pg';
+    cx: number;
+    cy: number;
+    val: number;
+  } | null>(null);
   const [dimDraft, setDimDraft] = useState('');
   const [dimError, setDimError] = useState<string | null>(null);
+  const [gridConfig, setGridConfig] = useState<GridConfig>(() => ({ ...DEFAULT_GRID_CONFIG }));
+  const [showGridPanel, setShowGridPanel] = useState(false);
+  const [polySides, setPolySides] = useState(4);
+  const [creationOrigin, setCreationOrigin] = useState<CreationOrigin>('center');
 
   // Phases & Shape Builder state
   const [phases, setPhases] = useState<Phase[]>(() => clonePhases(INITIAL_PHASES));
@@ -370,6 +486,7 @@ export default function App() {
   const [dragShapeRegionIds, setDragShapeRegionIds] = useState<Set<string>>(new Set());
   const [lockNotice, setLockNotice] = useState<string | null>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [alignPopoverOpen, setAlignPopoverOpen] = useState(false);
 
   const defaultPhaseId = phases[0]?.id ?? 'phase-1';
   const phaseMap = useMemo(() => {
@@ -439,7 +556,7 @@ export default function App() {
     const activeIdx = phaseIndexMap.get(activePhaseId) ?? 0;
     const curves: Curve[] = [];
     for (const o of objs) {
-      if (o.dead || (o.t !== 'ln' && o.t !== 'ci')) continue;
+      if (o.dead || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
       const pid = o.phaseId ?? defaultPhaseId;
       const ph = phaseMap.get(pid);
       if (ph && !ph.showGeometry) continue;
@@ -519,6 +636,10 @@ export default function App() {
   sizeRef.current = size;
   const toolRef = useRef(tool);
   toolRef.current = tool;
+  const lineModeRef = useRef(lineMode);
+  lineModeRef.current = lineMode;
+  const circleModeRef = useRef(circleMode);
+  circleModeRef.current = circleMode;
   const pendRef = useRef(pend);
   pendRef.current = pend;
   const tcSelRef = useRef(tcSel);
@@ -529,6 +650,8 @@ export default function App() {
   tanVariantIdxRef.current = tanVariantIdx;
   const selectedIdsRef = useRef(selectedIds);
   selectedIdsRef.current = selectedIds;
+  const selectedShapeIdsRef = useRef(selectedShapeIds);
+  selectedShapeIdsRef.current = selectedShapeIds;
   const selTanCandidatesRef = useRef(selTanCandidates);
   selTanCandidatesRef.current = selTanCandidates;
   const selectedEditInfoRef = useRef(selectedEditInfo);
@@ -545,6 +668,8 @@ export default function App() {
   tgOnRef.current = tgOn;
   const snapEnabledRef = useRef(snapEnabled);
   snapEnabledRef.current = snapEnabled;
+  const tanSnapEnabledRef = useRef(tanSnapEnabled);
+  tanSnapEnabledRef.current = tanSnapEnabled;
   const snapPxRef = useRef(snapPx);
   snapPxRef.current = snapPx;
   const refImgsRef = useRef(refImgs);
@@ -565,12 +690,19 @@ export default function App() {
   dimModeRef.current = dimMode;
   const editingDimRef = useRef(editingDim);
   editingDimRef.current = editingDim;
+  const gridConfigRef = useRef(gridConfig);
+  gridConfigRef.current = gridConfig;
+  const polySidesRef = useRef(polySides);
+  polySidesRef.current = polySides;
+  const creationOriginRef = useRef(creationOrigin);
+  creationOriginRef.current = creationOrigin;
 
   const histRef = useRef<HistorySnapshot[]>([]);
   const redoRef = useRef<HistorySnapshot[]>([]);
   const copiedRef = useRef<CopiedSubgraph | null>(null);
   const copyCursorRef = useRef<[number, number] | null>(null);
   const pasteCountRef = useRef(0);
+  const lastNativePasteAtRef = useRef(0);
   const lastWorldRef = useRef<[number, number]>([0, 0]);
   const panRef = useRef<{ sx: number; sy: number; vx: number; vy: number } | null>(null);
   const dragRef = useRef<DragState | null>(null);
@@ -579,9 +711,11 @@ export default function App() {
   const guideCounterRef = useRef(0);
   const phaseCounterRef = useRef(2);
   const shapeCounterRef = useRef(0);
+  const groupCounterRef = useRef(0);
   const lockTimerRef = useRef<number | null>(null);
   const shapeDragRef = useRef<ShapeDragState | null>(null);
   const marqueeRef = useRef<MarqueeBox | null>(null);
+  const marqueeShiftRef = useRef(false);
   const imgDragRef = useRef<ImgDragState | null>(null);
   const rafIdRef = useRef<number | null>(null);
   const pendingMoveRef = useRef<{
@@ -633,7 +767,7 @@ export default function App() {
       const targetIdx = phaseIndexMap.get(phaseId) ?? 0;
       const groupCurves: Curve[] = [];
       for (const o of objs) {
-        if (o.dead || (o.t !== 'ln' && o.t !== 'ci')) continue;
+        if (o.dead || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
         const pid = o.phaseId ?? defaultPhaseId;
         if (scope === 'phase') {
           if (pid !== phaseId) continue;
@@ -670,11 +804,14 @@ export default function App() {
     }
   }, [curveCache, defaultPhaseId, isDragging, objs, phaseIndexMap]);
 
-  const notifyLocked = useCallback((phaseId?: string) => {
-    const pid = phaseId ?? activePhaseIdRef.current;
-    const ph = phaseMapRef.current.get(pid);
-    const name = ph ? ph.name : 'Fase atual';
-    setLockNotice(`Fase "${name}" está bloqueada para edição`);
+  useEffect(() => {
+    if (selectedIds.size === 0 || tool !== 'move') {
+      setAlignPopoverOpen(false);
+    }
+  }, [selectedIds.size, tool]);
+
+  const notifyNotice = useCallback((msg: string) => {
+    setLockNotice(msg);
     if (lockTimerRef.current !== null) {
       window.clearTimeout(lockTimerRef.current);
     }
@@ -683,6 +820,16 @@ export default function App() {
       lockTimerRef.current = null;
     }, 3200);
   }, []);
+
+  const notifyLocked = useCallback(
+    (phaseId?: string) => {
+      const pid = phaseId ?? activePhaseIdRef.current;
+      const ph = phaseMapRef.current.get(pid);
+      const name = ph ? ph.name : 'Fase atual';
+      notifyNotice(`Fase "${name}" está bloqueada para edição`);
+    },
+    [notifyNotice]
+  );
 
   const isPhaseLocked = useCallback((phaseId?: string): boolean => {
     const pid = phaseId ?? defaultPhaseIdRef.current;
@@ -708,7 +855,8 @@ export default function App() {
       snapshotObjs: GeomObj[],
       snapshotShapes: BuiltShape[] = shapesRef.current,
       snapshotPhases: Phase[] = phasesRef.current,
-      snapshotActivePhaseId: string = activePhaseIdRef.current
+      snapshotActivePhaseId: string = activePhaseIdRef.current,
+      snapshotGuides: GuideLine[] = guidesRef.current
     ) => {
       const h = histRef.current;
       h.push({
@@ -717,6 +865,7 @@ export default function App() {
         phases: clonePhases(snapshotPhases),
         activePhaseId: snapshotActivePhaseId,
         refImgs: cloneRefImgs(refImgsRef.current),
+        guides: cloneGuides(snapshotGuides),
       });
       if (h.length > 200) h.shift();
       redoRef.current = [];
@@ -734,10 +883,14 @@ export default function App() {
       setPhases(clonePhases(snapShot.phases));
       setActivePhaseId(snapShot.activePhaseId);
       setRefImgs(cloneRefImgs(snapShot.refImgs));
+      setGuides(cloneGuides(snapShot.guides ?? []));
+      setSelectedGuideId(null);
       setSelectedIds(new Set());
+      setSelectedShapeIds(new Set());
       setHoveredSelTanCand(null);
       setHoveredResizeGrip(false);
       setDragTanOverlay(null);
+      setSmartGuides([]);
       activeDragTanRef.current = null;
       setPend([]);
       setTcSel([]);
@@ -765,6 +918,7 @@ export default function App() {
       phases: clonePhases(phasesRef.current),
       activePhaseId: activePhaseIdRef.current,
       refImgs: cloneRefImgs(refImgsRef.current),
+      guides: cloneGuides(guidesRef.current),
     });
     restoreSnapshot(histRef.current.pop()!);
   }, [restoreSnapshot]);
@@ -777,6 +931,7 @@ export default function App() {
       phases: clonePhases(phasesRef.current),
       activePhaseId: activePhaseIdRef.current,
       refImgs: cloneRefImgs(refImgsRef.current),
+      guides: cloneGuides(guidesRef.current),
     });
     restoreSnapshot(redoRef.current.pop()!);
   }, [restoreSnapshot]);
@@ -794,7 +949,14 @@ export default function App() {
       let bestId: number | null = null;
       let bestD = 11 / vK;
       for (const o of curObjs) {
-        if (o.dead || !vis.has(o.id) || excludeIds.has(o.id) || (o.t !== 'ci' && o.t !== 'ln')) continue;
+        if (
+          o.dead ||
+          !vis.has(o.id) ||
+          excludeIds.has(o.id) ||
+          (o.t !== 'ci' && o.t !== 'ln' && o.t !== 'pg')
+        ) {
+          continue;
+        }
         const cv = curve(curObjs, o, cCache);
         if (!cv) continue;
         const d = distToCurve(cv, x, y);
@@ -829,19 +991,23 @@ export default function App() {
       const pid = activePhaseIdRef.current;
       pushHistory(objsRef.current);
       const next = cloneObjs(objsRef.current);
+      const hasEdges = sol.edges && sol.edges.some((e) => e !== undefined);
       const ci = addObj(next, {
         t: 'ci',
         phaseId: pid,
         tanSet: sel.map((s) => s.id),
+        ...(hasEdges ? { tanEdges: sol.edges!.map((e) => e ?? -1) } : {}),
         tanSigns: [...sol.signs],
         tanRef: { x: sol.cx, y: sol.cy, r: sol.r },
+        ...(gridConfigRef.current.lockScale ? { scaleLocked: true } : {}),
       });
       for (const s of sel) {
         const targetObj = getObj(next, s.id);
-        if (targetObj && (targetObj.t === 'ci' || targetObj.t === 'ln')) {
+        if (targetObj && (targetObj.t === 'ci' || targetObj.t === 'ln' || targetObj.t === 'pg')) {
           addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci, tg: s.id, phaseId: pid });
         }
       }
+      recalc(next);
       setObjs(next);
       setTanSel([]);
       setHoveredTanTarget(null);
@@ -873,9 +1039,13 @@ export default function App() {
     const effSnap = snapEnabledRef.current && !alt;
     const curEdit = editRef.current;
     const curTool = toolRef.current;
+    const curLineMode = lineModeRef.current;
+    const curCircleMode = circleModeRef.current;
     const curPend = pendRef.current;
     const curTcSel = tcSelRef.current;
-    const tgMode = sh || tgOnRef.current;
+    const tgMode =
+      (sh || tgOnRef.current || (curTool === 'ln' && curLineMode === 'tangent')) &&
+      tanSnapEnabledRef.current;
     const activeGuides = guidesVisibleRef.current ? guidesRef.current : undefined;
     const snapIds = allowedSnapIdsRef.current;
 
@@ -894,7 +1064,8 @@ export default function App() {
         inters,
         activeGuides,
         cCache,
-        snapIds
+        snapIds,
+        !alt ? gridConfigRef.current : undefined
       );
       const A = { x: curEdit.ax, y: curEdit.ay };
       const tg = tgMode
@@ -902,10 +1073,10 @@ export default function App() {
         : null;
       if (tg) {
         const contacts: Array<{ x: number; y: number }> = [];
-        const c1 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan, cCache);
+        const c1 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan, cCache, tg.tanEdge);
         if (c1) contacts.push(c1);
         if (tg.tan2 !== undefined) {
-          const c2 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan2, cCache);
+          const c2 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan2, cCache, tg.tan2Edge);
           if (c2) contacts.push(c2);
         }
         setGhost({
@@ -950,7 +1121,7 @@ export default function App() {
       setHoveredSelTanCand(null);
       setHoveredResizeGrip(false);
 
-      if (curTool === 'tcir') {
+      if (curTool === 'ci' && curCircleMode === 'tangent') {
         const curTan = tanSelRef.current;
         const exclude = new Set(curTan.map((s) => s.id));
         const hitId = curTan.length < 4 ? findTanTargetAt(curObjs, cCache, x, y, vK, exclude) : null;
@@ -990,30 +1161,47 @@ export default function App() {
       }
 
       setHoveredTanTarget(null);
-      const h = snap(curObjs, x, y, vK, curPrio, curSnapPx, effSnap, inters, activeGuides, cCache, snapIds);
+      const gCfg = gridConfigRef.current;
+      const h = snap(
+        curObjs,
+        x,
+        y,
+        vK,
+        curPrio,
+        curSnapPx,
+        effSnap,
+        inters,
+        activeGuides,
+        cCache,
+        snapIds,
+        !alt ? gCfg : undefined
+      );
 
       let nextGhost: GhostPreview | null = null;
       let nextHover: SnapResult | null = h;
+      const originMode = creationOriginRef.current;
 
-      if (curTool === 'tc' && curTcSel.length === 2) {
+      if (curTool === 'ln' && curLineMode === 'common' && curTcSel.length === 2) {
         const g = commonTanFor(curObjs, curTcSel[0], curTcSel[1], x, y, cCache);
         if (g) nextGhost = { ln: g.line, label: 'Tangente comum' };
-      } else if (curTool === 'ln' && curPend.length === 1) {
+      } else if (curTool === 'ln' && curLineMode !== 'common' && curPend.length === 1) {
         const tg = tgMode
           ? tangentLineFor(curObjs, curPend[0], x, y, vK, curPrio, curSnapPx, cCache, snapIds)
           : null;
         if (tg) {
-          const targetCircle = curve(curObjs, getObj(curObjs, tg.to), cCache);
+          const targetCurve = curve(curObjs, getObj(curObjs, tg.to), cCache);
           const guidelines: Guideline[] =
-            targetCircle && targetCircle.t === 'c'
-              ? [{ x1: targetCircle.x, y1: targetCircle.y, x2: tg.contact.x, y2: tg.contact.y, kind: 'normal' }]
-              : [];
+            targetCurve && targetCurve.t === 'c'
+              ? [{ x1: targetCurve.x, y1: targetCurve.y, x2: tg.contact.x, y2: tg.contact.y, kind: 'normal' }]
+              : targetCurve && targetCurve.t === 'p'
+                ? [{ x1: targetCurve.cx, y1: targetCurve.cy, x2: tg.contact.x, y2: tg.contact.y, kind: 'normal' }]
+                : [];
           nextGhost = {
             ln: tg.line,
             tan: tg.to,
             contacts: [tg.contact],
             guidelines,
-            label: 'Tangente',
+            label: tg.polyVertexIdx !== undefined ? 'Tangente ao vértice' : 'Tangente',
           };
           nextHover = null;
         } else {
@@ -1026,7 +1214,7 @@ export default function App() {
             }
           }
         }
-      } else if (curTool === 'cb' && curPend.length === 1) {
+      } else if (curTool === 'ci' && curCircleMode === 'diameter' && curPend.length === 1) {
         const A = getObj(curObjs, curPend[0]);
         if (A && A.t === 'pt' && A.ok) {
           const tg = tgMode
@@ -1034,10 +1222,10 @@ export default function App() {
             : null;
           if (tg) {
             const contacts: Array<{ x: number; y: number }> = [];
-            const c1 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan, cCache);
+            const c1 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan, cCache, tg.tanEdge);
             if (c1) contacts.push(c1);
             if (tg.tan2 !== undefined) {
-              const c2 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan2, cCache);
+              const c2 = circleContactPoint(curObjs, tg.cx, tg.cy, tg.r, tg.tan2, cCache, tg.tan2Edge);
               if (c2) contacts.push(c2);
             }
             nextGhost = {
@@ -1052,34 +1240,191 @@ export default function App() {
             };
             nextHover = null;
           } else {
-            nextGhost = {
-              x: (A.x + h.x) / 2,
-              y: (A.y + h.y) / 2,
-              r: Math.hypot(h.x - A.x, h.y - A.y) / 2,
-            };
+            const rawD = Math.hypot(h.x - A.x, h.y - A.y);
+            if (!alt && gCfg.sizeRule !== 'free' && h.k === 'free' && !h.guideTag && rawD > 1e-3) {
+              const rule = snapSizeByRule(rawD, gCfg);
+              const ang = Math.atan2(h.y - A.y, h.x - A.x);
+              const bx = A.x + rule.snapped * Math.cos(ang);
+              const by = A.y + rule.snapped * Math.sin(ang);
+              nextGhost = {
+                x: (A.x + bx) / 2,
+                y: (A.y + by) / 2,
+                r: rule.snapped / 2,
+                label: rule.tag ? `${rule.tag} · Ø ${formatNumForInput(rule.snapped)}` : undefined,
+              };
+              nextHover = { ...h, x: bx, y: by };
+            } else {
+              nextGhost = {
+                x: (A.x + h.x) / 2,
+                y: (A.y + h.y) / 2,
+                r: rawD / 2,
+              };
+            }
           }
         }
-      } else if (curTool === 'ci' && curPend.length === 1) {
+      } else if (
+        curTool === 'ci' &&
+        (curCircleMode === 'center' || curCircleMode === 'top-left') &&
+        curPend.length === 1
+      ) {
         const c = getObj(curObjs, curPend[0]);
         if (c && c.t === 'pt' && c.ok) {
-          const tg = tgMode
-            ? tangentFor(curObjs, curPend[0], x, y, vK, curPrio, curSnapPx, cCache, snapIds)
-            : null;
-          if (tg) {
-            const contact = circleContactPoint(curObjs, c.x, c.y, tg.r, tg.tan, cCache);
-            const contacts = contact ? [contact] : [];
-            nextGhost = {
-              x: c.x,
-              y: c.y,
-              r: tg.r,
-              tan: tg.tan,
-              contacts,
-              guidelines: buildTangencyGuidelines(c.x, c.y, contacts),
-              label: 'Tangente',
-            };
-            nextHover = null;
+          if (curCircleMode === 'top-left' || originMode === 'top-left') {
+            const dx = h.x - c.x;
+            const dy = h.y - c.y;
+            const sx = dx >= 0 ? 1 : -1;
+            const sy = dy >= 0 ? 1 : -1;
+            const rawD = Math.max(Math.abs(dx), Math.abs(dy));
+            if (rawD > 1e-3) {
+              let d = rawD;
+              let tag: string | null = null;
+              if (!alt && gCfg.sizeRule !== 'free' && h.k === 'free' && !h.guideTag) {
+                const rule = snapSizeByRule(rawD, gCfg);
+                d = rule.snapped;
+                tag = rule.tag;
+              }
+              const r = d / 2;
+              const cx = c.x + sx * r;
+              const cy = c.y + sy * r;
+              const bx = c.x + sx * d;
+              const by = c.y + sy * d;
+              nextGhost = {
+                x: cx,
+                y: cy,
+                r,
+                box: { x: Math.min(c.x, bx), y: Math.min(c.y, by), w: d, h: d },
+                label: tag ? `${tag} · Ø ${formatNumForInput(d)}` : `Ø ${formatNumForInput(d)}`,
+              };
+              if (h.k === 'free' && !h.guideTag) {
+                nextHover = { ...h, x: bx, y: by };
+              }
+            }
           } else {
-            nextGhost = { x: c.x, y: c.y, r: Math.hypot(h.x - c.x, h.y - c.y) };
+            const tg = tgMode
+              ? tangentFor(curObjs, curPend[0], x, y, vK, curPrio, curSnapPx, cCache, snapIds)
+              : null;
+            if (tg) {
+              const contact = circleContactPoint(curObjs, c.x, c.y, tg.r, tg.tan, cCache, tg.tanEdge);
+              const contacts = contact ? [contact] : [];
+              nextGhost = {
+                x: c.x,
+                y: c.y,
+                r: tg.r,
+                tan: tg.tan,
+                contacts,
+                guidelines: buildTangencyGuidelines(c.x, c.y, contacts),
+                label: 'Tangente',
+              };
+              nextHover = null;
+            } else {
+              const rawR = Math.hypot(h.x - c.x, h.y - c.y);
+              if (!alt && gCfg.sizeRule !== 'free' && h.k === 'free' && !h.guideTag && rawR > 1e-3) {
+                const rule = snapSizeByRule(rawR * 2, gCfg);
+                const snappedR = rule.snapped / 2;
+                const ang = Math.atan2(h.y - c.y, h.x - c.x);
+                nextGhost = {
+                  x: c.x,
+                  y: c.y,
+                  r: snappedR,
+                  label: rule.tag ? `${rule.tag} · Ø ${formatNumForInput(rule.snapped)}` : undefined,
+                };
+                nextHover = { ...h, x: c.x + snappedR * Math.cos(ang), y: c.y + snappedR * Math.sin(ang) };
+              } else {
+                nextGhost = { x: c.x, y: c.y, r: rawR };
+              }
+            }
+          }
+        }
+      } else if (curTool === 'pg' && curPend.length === 1) {
+        const c = getObj(curObjs, curPend[0]);
+        if (c && c.t === 'pt' && c.ok) {
+          const sides = Math.max(3, polySidesRef.current);
+          if (originMode === 'top-left') {
+            const dx = h.x - c.x;
+            const dy = h.y - c.y;
+            const sx = dx >= 0 ? 1 : -1;
+            const sy = dy >= 0 ? 1 : -1;
+            const rawBox = Math.max(Math.abs(dx), Math.abs(dy));
+            if (rawBox > 1e-3) {
+              let boxSide = rawBox;
+              let tag: string | null = null;
+              if (!alt && gCfg.sizeRule !== 'free' && h.k === 'free' && !h.guideTag) {
+                const rule = snapSizeByRule(rawBox, gCfg);
+                boxSide = rule.snapped;
+                tag = rule.tag;
+              }
+              const cx = c.x + sx * (boxSide / 2);
+              const cy = c.y + sy * (boxSide / 2);
+              const bx = c.x + sx * boxSide;
+              const by = c.y + sy * boxSide;
+              const rot = sides === 4 ? Math.PI / 4 : -Math.PI / 2;
+              const r = sides === 4 ? boxSide / Math.SQRT2 : boxSide / 2;
+              const polySide = 2 * r * Math.sin(Math.PI / sides);
+              const verts: Array<{ x: number; y: number }> = [];
+              const stepA = (Math.PI * 2) / sides;
+              for (let i = 0; i < sides; i++) {
+                const a = rot + i * stepA;
+                verts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
+              }
+              nextGhost = {
+                pg: {
+                  t: 'p',
+                  cx,
+                  cy,
+                  r,
+                  rot,
+                  sides,
+                  side: polySide,
+                  verts,
+                },
+                box: { x: Math.min(c.x, bx), y: Math.min(c.y, by), w: boxSide, h: boxSide },
+                label: tag
+                  ? `${tag} · L ${formatNumForInput(polySide)}`
+                  : `L ${formatNumForInput(polySide)}`,
+              };
+              if (h.k === 'free' && !h.guideTag) {
+                nextHover = { ...h, x: bx, y: by };
+              }
+            }
+          } else {
+            const polySnap = resolvePolyCorner(
+              c.x,
+              c.y,
+              h.x,
+              h.y,
+              h.k === 'free' && !h.guideTag,
+              sides,
+              sh,
+              alt,
+              effSnap,
+              gCfg
+            );
+            if (polySnap) {
+              const verts: Array<{ x: number; y: number }> = [];
+              const stepA = (Math.PI * 2) / sides;
+              for (let i = 0; i < sides; i++) {
+                const a = polySnap.rot + i * stepA;
+                verts.push({ x: c.x + polySnap.r * Math.cos(a), y: c.y + polySnap.r * Math.sin(a) });
+              }
+              nextGhost = {
+                pg: {
+                  t: 'p',
+                  cx: c.x,
+                  cy: c.y,
+                  r: polySnap.r,
+                  rot: polySnap.rot,
+                  sides,
+                  side: polySnap.side,
+                  verts,
+                },
+                label: polySnap.tag
+                  ? `${polySnap.tag} · L ${formatNumForInput(polySnap.side)}`
+                  : `L ${formatNumForInput(polySnap.side)}`,
+              };
+              if (h.k === 'free' && !h.guideTag) {
+                nextHover = { ...h, x: polySnap.px, y: polySnap.py };
+              }
+            }
           }
         }
       }
@@ -1131,7 +1476,7 @@ export default function App() {
       const hitCurve =
         !hitPt &&
         curObjs.some((o) => {
-          if (o.dead || (o.t !== 'ln' && o.t !== 'ci')) return false;
+          if (o.dead || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) return false;
           const cv = curve(curObjs, o, cCache);
           return cv ? distToCurve(cv, x, y) <= 9 / vK : false;
         });
@@ -1226,7 +1571,10 @@ export default function App() {
       const cCache = curveCacheRef.current;
       const snapIds = allowedSnapIdsRef.current;
       const A = { x: E.ax, y: E.ay };
-      const tg = sh ? tanSolve(curObjs, A, x, y, E.bad, vK, curPrio, curSnapPx, cCache, snapIds) : null;
+      const tg =
+        tanSnapEnabledRef.current && sh
+          ? tanSolve(curObjs, A, x, y, E.bad, vK, curPrio, curSnapPx, cCache, snapIds)
+          : null;
       let sb: SnapResult | null = null;
       if (!tg) {
         sb = safeSnap(
@@ -1241,7 +1589,8 @@ export default function App() {
           cachedIntersRef.current,
           activeGuides,
           cCache,
-          snapIds
+          snapIds,
+          !alt ? gridConfigRef.current : undefined
         );
         if (Math.hypot(sb.x - A.x, sb.y - A.y) < 1e-6) return;
       }
@@ -1254,7 +1603,22 @@ export default function App() {
       const fields = tg ? { e: aid, ...tanFields(tg) } : { d1: aid, d2: commitSnap(next, sb!, pid) };
       const o = next[E.id];
       if (o && o.t === 'ci') {
-        for (const k of ['c', 'p', 'tan', 'm', 'e', 'ang', 'sg', 'tan2', 'sg2', 'kk', 'd1', 'd2'] as const) {
+        for (const k of [
+          'c',
+          'p',
+          'tan',
+          'tanEdge',
+          'm',
+          'e',
+          'ang',
+          'sg',
+          'tan2',
+          'tan2Edge',
+          'sg2',
+          'kk',
+          'd1',
+          'd2',
+        ] as const) {
           delete o[k];
         }
         Object.assign(o, fields);
@@ -1292,7 +1656,7 @@ export default function App() {
       let bestD = 9 / vK;
       const cCache = curveCacheRef.current;
       for (const o of curObjs) {
-        if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci')) continue;
+        if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
         const cv = curve(curObjs, o, cCache);
         if (!cv) continue;
         const d = distToCurve(cv, x, y);
@@ -1321,6 +1685,11 @@ export default function App() {
     copyCursorRef.current = [...lastWorldRef.current];
     pasteCountRef.current = 0;
     setHasClipboard(true);
+    try {
+      void navigator.clipboard?.writeText(`compasso-geom:${JSON.stringify(sub)}`).catch(() => {});
+    } catch {
+      // ignore clipboard permissions inside restricted frames
+    }
   }, []);
 
   const pasteClipboard = useCallback(
@@ -1398,16 +1767,252 @@ export default function App() {
     setSelectedIds(new Set());
   }, [isObjLocked, notifyLocked, pushHistory]);
 
+  const handleAlignSelection = useCallback(
+    (mode: AlignMode) => {
+      const curObjs = objsRef.current;
+      const sel = selectedIdsRef.current;
+      if (sel.size === 0) return;
+      const res = alignObjects(curObjs, sel, mode, (list, id) => isObjLocked(list, id));
+      if (!res.ok || !res.next) {
+        const anyUnlocked = Array.from(sel).some((id) => !isObjLocked(curObjs, id));
+        if (!anyUnlocked) notifyLocked();
+        return;
+      }
+      pushHistory(curObjs);
+      setObjs(res.next);
+    },
+    [isObjLocked, notifyLocked, pushHistory]
+  );
+
+  const handleDistributeSelection = useCallback(
+    (axis: DistributeAxis) => {
+      const curObjs = objsRef.current;
+      const sel = selectedIdsRef.current;
+      if (sel.size === 0) return;
+      const res = distributeObjects(curObjs, sel, axis, (list, id) => isObjLocked(list, id));
+      if (!res.ok || !res.next) {
+        const anyUnlocked = Array.from(sel).some((id) => !isObjLocked(curObjs, id));
+        if (!anyUnlocked) notifyLocked();
+        return;
+      }
+      pushHistory(curObjs);
+      setObjs(res.next);
+    },
+    [isObjLocked, notifyLocked, pushHistory]
+  );
+
+  const handleGroupSelection = useCallback(() => {
+    const curObjs = objsRef.current;
+    const sel = selectedIdsRef.current;
+    if (sel.size < 2) return;
+    const gid = `grp-${Date.now()}-${++groupCounterRef.current}`;
+    const res = groupObjects(curObjs, sel, gid);
+    if (!res.ok || !res.next) return;
+    pushHistory(curObjs);
+    setObjs(res.next);
+  }, [pushHistory]);
+
+  const handleUngroupSelection = useCallback(() => {
+    const curObjs = objsRef.current;
+    const sel = selectedIdsRef.current;
+    if (sel.size === 0) return;
+    const res = ungroupObjects(curObjs, sel);
+    if (!res.ok || !res.next) return;
+    pushHistory(curObjs);
+    setObjs(res.next);
+  }, [pushHistory]);
+
+  const handleCombineSelectedShapes = useCallback(
+    (op: CombineShapeOp) => {
+      const pid = activePhaseIdRef.current;
+      if (isPhaseLocked(pid)) {
+        notifyLocked(pid);
+        return;
+      }
+      const curObjs = objsRef.current;
+      const cCache = curveCacheRef.current;
+      const curvesInOrder: Array<CircleCurve | PolyCurve> = [];
+      for (const id of selectedIdsRef.current) {
+        const o = getObj(curObjs, id);
+        if (!o || o.dead || (o.t !== 'ci' && o.t !== 'pg')) continue;
+        const cv = curve(curObjs, o, cCache);
+        if (cv && (cv.t === 'c' || cv.t === 'p')) curvesInOrder.push(cv);
+      }
+      if (curvesInOrder.length < 2) return;
+      const nextShape = combineClosedCurvesAsShape(
+        curvesInOrder,
+        op,
+        pid,
+        `sh-${++shapeCounterRef.current}`,
+        shapeScopeRef.current
+      );
+      if (!nextShape) {
+        notifyNotice('A combinação escolhida não gerou área resultante.');
+        return;
+      }
+      pushHistory(curObjs);
+      setShapes((prev) => [...prev, nextShape]);
+      setAlignPopoverOpen(false);
+    },
+    [isPhaseLocked, notifyLocked, notifyNotice, pushHistory]
+  );
+
+  const handleToggleScaleLockSelection = useCallback(() => {
+    const curObjs = objsRef.current;
+    const sel = selectedIdsRef.current;
+    if (sel.size === 0) return;
+    const targets: number[] = [];
+    let anyPhaseLocked = false;
+    for (const id of sel) {
+      const o = getObj(curObjs, id);
+      if (!o || o.dead || (o.t !== 'ci' && o.t !== 'pg')) continue;
+      if (isObjLocked(curObjs, o.id)) {
+        anyPhaseLocked = true;
+        continue;
+      }
+      targets.push(o.id);
+    }
+    if (targets.length === 0) {
+      if (anyPhaseLocked) notifyLocked();
+      return;
+    }
+    const allLocked = targets.every((id) => {
+      const o = getObj(curObjs, id);
+      return !!(o && (o.t === 'ci' || o.t === 'pg') && o.scaleLocked);
+    });
+    const nextLocked = !allLocked;
+    pushHistory(curObjs);
+    const next = cloneObjs(curObjs);
+    for (const id of targets) {
+      const o = getObj(next, id);
+      if (!o || (o.t !== 'ci' && o.t !== 'pg')) continue;
+      if (nextLocked) o.scaleLocked = true;
+      else delete o.scaleLocked;
+    }
+    setObjs(next);
+  }, [isObjLocked, notifyLocked, pushHistory]);
+
+  const handleMirrorSelection = useCallback(
+    (axis: MirrorAxis) => {
+      const pid = activePhaseIdRef.current;
+      if (isPhaseLocked(pid)) {
+        notifyLocked(pid);
+        return;
+      }
+      const curObjs = objsRef.current;
+      const res = mirrorObjects(curObjs, selectedIdsRef.current, axis, pid);
+      if (!res.ok || !res.next) return;
+      pushHistory(curObjs);
+      setObjs(res.next);
+      if (res.createdIds && res.createdIds.length > 0) {
+        setSelectedIds(new Set(res.createdIds));
+      }
+    },
+    [isPhaseLocked, notifyLocked, pushHistory]
+  );
+
+  const handleRadialArraySelection = useCallback(
+    (count: number) => {
+      const pid = activePhaseIdRef.current;
+      if (isPhaseLocked(pid)) {
+        notifyLocked(pid);
+        return;
+      }
+      const curObjs = objsRef.current;
+      const sel = selectedIdsRef.current;
+      const bounds = getSelectionBoundingBox(curObjs, sel);
+      if (!bounds) return;
+
+      const gCfg = gridConfigRef.current;
+      let pivot = { x: bounds.cx, y: bounds.cy };
+      if (gCfg.enabled && Math.hypot(gCfg.originX - bounds.cx, gCfg.originY - bounds.cy) > 2) {
+        pivot = { x: gCfg.originX, y: gCfg.originY };
+      } else if (getAlignUnitCount(curObjs, sel) === 1 && sel.size === 1) {
+        const only = getObj(curObjs, Array.from(sel)[0]);
+        if (only && (only.t === 'ci' || only.t === 'pg')) {
+          pivot = { x: bounds.cx, y: bounds.maxY };
+        }
+      }
+
+      const res = radialArrayObjects(curObjs, sel, count, pivot, pid);
+      if (!res.ok || !res.next) return;
+      pushHistory(curObjs);
+      setObjs(res.next);
+      if (res.createdIds && res.createdIds.length > 0) {
+        setSelectedIds(new Set([...sel, ...res.createdIds]));
+      }
+    },
+    [isPhaseLocked, notifyLocked, pushHistory]
+  );
+
+  const handleDeleteSelectedShapes = useCallback(() => {
+    const sel = selectedShapeIdsRef.current;
+    if (sel.size === 0) return;
+    const unlockedIds = new Set<string>();
+    let blockedPhaseId: string | undefined;
+    for (const sh of shapesRef.current) {
+      if (!sel.has(sh.id)) continue;
+      if (isPhaseLocked(sh.phaseId)) {
+        blockedPhaseId = sh.phaseId;
+      } else {
+        unlockedIds.add(sh.id);
+      }
+    }
+    if (unlockedIds.size === 0) {
+      if (blockedPhaseId) notifyLocked(blockedPhaseId);
+      return;
+    }
+    pushHistory(objsRef.current);
+    setShapes((prev) => prev.filter((s) => !unlockedIds.has(s.id)));
+    setSelectedShapeIds(new Set());
+  }, [isPhaseLocked, notifyLocked, pushHistory]);
+
+  const handleMoveSelectedShapesToPhase = useCallback(
+    (targetPhaseId: string) => {
+      const sel = selectedShapeIdsRef.current;
+      if (sel.size === 0) return;
+      if (isPhaseLocked(targetPhaseId)) {
+        notifyLocked(targetPhaseId);
+        return;
+      }
+      const unlockedIds = new Set<string>();
+      let blockedPhaseId: string | undefined;
+      for (const sh of shapesRef.current) {
+        if (!sel.has(sh.id)) continue;
+        if (isPhaseLocked(sh.phaseId)) {
+          blockedPhaseId = sh.phaseId;
+        } else {
+          unlockedIds.add(sh.id);
+        }
+      }
+      if (unlockedIds.size === 0) {
+        if (blockedPhaseId) notifyLocked(blockedPhaseId);
+        return;
+      }
+      pushHistory(objsRef.current);
+      setShapes((prev) =>
+        prev.map((s) => (unlockedIds.has(s.id) ? { ...s, phaseId: targetPhaseId } : s))
+      );
+      setActivePhaseId(targetPhaseId);
+    },
+    [isPhaseLocked, notifyLocked, pushHistory]
+  );
+
   const handleOpenDimEditor = useCallback(
-    (id: number, cx: number, cy: number, r: number) => {
+    (id: number, kind: 'ci' | 'pg', cx: number, cy: number, val: number) => {
       if (isObjLocked(objsRef.current, id)) {
         const co = getObj(objsRef.current, id);
         notifyLocked(co?.phaseId);
         return;
       }
-      const val = dimModeRef.current === 'r' ? r : r * 2;
-      setEditingDim({ id, cx, cy, r });
-      setDimDraft(formatNumForInput(val));
+      const co = getObj(objsRef.current, id);
+      if (co && (co.t === 'ci' || co.t === 'pg') && co.scaleLocked) {
+        notifyNotice('Escala travada — desbloqueie para alterar o tamanho.');
+        return;
+      }
+      const displayVal = kind === 'ci' ? (dimModeRef.current === 'r' ? val : val * 2) : val;
+      setEditingDim({ id, kind, cx, cy, val });
+      setDimDraft(formatNumForInput(displayVal));
       setDimError(null);
       setSelectedIds(new Set([id]));
       setEdit(null);
@@ -1415,34 +2020,50 @@ export default function App() {
       setTcSel([]);
       setGhost(null);
     },
-    [isObjLocked, notifyLocked]
+    [isObjLocked, notifyLocked, notifyNotice]
   );
 
-  const handleCommitDimEdit = useCallback(() => {
-    const ed = editingDimRef.current;
-    if (!ed) return;
-    if (isObjLocked(objsRef.current, ed.id)) {
-      const co = getObj(objsRef.current, ed.id);
-      notifyLocked(co?.phaseId);
+  const handleCommitDimEdit = useCallback(
+    (overrideVal?: number) => {
+      const ed = editingDimRef.current;
+      if (!ed) return;
+      if (isObjLocked(objsRef.current, ed.id)) {
+        const co = getObj(objsRef.current, ed.id);
+        notifyLocked(co?.phaseId);
+        setEditingDim(null);
+        return;
+      }
+      const parsed =
+        overrideVal !== undefined ? overrideVal : Number(dimDraft.trim().replace(',', '.'));
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setDimError('Digite um valor numérico maior que zero.');
+        return;
+      }
+      if (ed.kind === 'pg') {
+        const res = setPolygonSide(objsRef.current, ed.id, parsed);
+        if (!res.ok || !res.next) {
+          setDimError(res.reason ?? 'Não foi possível ajustar esse lado.');
+          return;
+        }
+        pushHistory(objsRef.current);
+        setObjs(res.next);
+        setEditingDim(null);
+        setDimError(null);
+        return;
+      }
+      const newR = dimModeRef.current === 'r' ? parsed : parsed / 2;
+      const res = setCircleRadius(objsRef.current, ed.id, newR);
+      if (!res.ok || !res.next) {
+        setDimError(res.reason ?? 'Não foi possível ajustar esse raio.');
+        return;
+      }
+      pushHistory(objsRef.current);
+      setObjs(res.next);
       setEditingDim(null);
-      return;
-    }
-    const parsed = Number(dimDraft.trim().replace(',', '.'));
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      setDimError('Digite um valor numérico maior que zero.');
-      return;
-    }
-    const newR = dimModeRef.current === 'r' ? parsed : parsed / 2;
-    const res = setCircleRadius(objsRef.current, ed.id, newR);
-    if (!res.ok || !res.next) {
-      setDimError(res.reason ?? 'Não foi possível ajustar esse raio.');
-      return;
-    }
-    pushHistory(objsRef.current);
-    setObjs(res.next);
-    setEditingDim(null);
-    setDimError(null);
-  }, [dimDraft, isObjLocked, notifyLocked, pushHistory]);
+      setDimError(null);
+    },
+    [dimDraft, isObjLocked, notifyLocked, pushHistory]
+  );
 
   const handleCancelDimEdit = useCallback(() => {
     setEditingDim(null);
@@ -1505,6 +2126,7 @@ export default function App() {
             : latestPreview.kind === 'v'
               ? { id, kind: 'v', x: latestPreview.x }
               : { ...latestPreview, id };
+        pushHistory(objsRef.current);
         setGuides((prev) => [...prev, committed]);
         setGuidesVisible(true);
         setSelectedGuideId(id);
@@ -1514,7 +2136,7 @@ export default function App() {
     window.addEventListener('pointermove', updateFromEvent);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onUp);
-  }, []);
+  }, [pushHistory]);
 
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<SVGSVGElement>) => {
@@ -1549,7 +2171,11 @@ export default function App() {
         return;
       }
 
-      const tgMode = e.shiftKey || tgOnRef.current;
+      const tgMode =
+        (e.shiftKey ||
+          tgOnRef.current ||
+          (toolRef.current === 'ln' && lineModeRef.current === 'tangent')) &&
+        tanSnapEnabledRef.current;
       const alt = e.altKey;
 
       if (editRef.current) {
@@ -1686,12 +2312,12 @@ export default function App() {
           }
         }
 
-        // 2. If no point hit, hit-test visible curves (circles & lines)
+        // 2. If no point hit, hit-test visible curves (circles, lines & polygons)
         if (hitId === null) {
           let bestCurveD = 9 / vK;
           const cCache = curveCacheRef.current;
           for (const o of curObjs) {
-            if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci')) continue;
+            if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) continue;
             const cv = curve(curObjs, o, cCache);
             if (!cv) continue;
             const d = distToCurve(cv, x, y);
@@ -1704,13 +2330,25 @@ export default function App() {
 
         if (hitId !== null) {
           setSelectedGuideId(null);
+          setSelectedShapeIds(new Set());
+          const hitObj = getObj(curObjs, hitId);
+          const groupMembers =
+            hitObj?.groupId
+              ? curObjs
+                  .filter((o) => !o.dead && vis.has(o.id) && o.groupId === hitObj.groupId)
+                  .map((o) => o.id)
+              : [hitId];
           let nextSel = new Set(selectedIdsRef.current);
           if (e.shiftKey) {
-            if (nextSel.has(hitId)) nextSel.delete(hitId);
-            else nextSel.add(hitId);
+            const allPresent = groupMembers.every((gid) => nextSel.has(gid));
+            if (allPresent) {
+              for (const gid of groupMembers) nextSel.delete(gid);
+            } else {
+              for (const gid of groupMembers) nextSel.add(gid);
+            }
             setSelectedIds(nextSel);
           } else if (!nextSel.has(hitId)) {
-            nextSel = new Set([hitId]);
+            nextSel = new Set(groupMembers);
             setSelectedIds(nextSel);
           }
 
@@ -1723,7 +2361,18 @@ export default function App() {
             dragRef.current = { kind: 'point', id: hitPt.id, saved: false };
             setIsDragging(true);
           } else {
-            const movableIds = movableRootPointsForSelection(curObjs, nextSel).filter(
+            const lockedEdgeCi =
+              hitPt && nextSel.size === 1
+                ? curObjs.find(
+                    (o): o is CircleObj =>
+                      !o.dead &&
+                      o.t === 'ci' &&
+                      !!o.scaleLocked &&
+                      (o.p === hitPt!.id || o.d1 === hitPt!.id || o.d2 === hitPt!.id)
+                  )
+                : undefined;
+            const rootSelection = lockedEdgeCi ? new Set([lockedEdgeCi.id]) : nextSel;
+            const movableIds = movableRootPointsForSelection(curObjs, rootSelection).filter(
               (pid) => !isObjLocked(curObjs, pid)
             );
             if (movableIds.length > 0) {
@@ -1735,16 +2384,25 @@ export default function App() {
                 let modifiedCurveId: number | undefined;
                 let fixedCenter: boolean | undefined;
                 let anchorEnd: 'a' | 'b' | undefined;
+                let pgCornerEdit:
+                  | { polyId: number; cx: number; cy: number; sides: number; lockedRadius?: number }
+                  | undefined;
                 if (nextSel.size === 1) {
                   if (!hitPt) {
                     const o = getObj(curObjs, hitId);
-                    if (o && (o.t === 'ci' || o.t === 'ln')) {
+                    if (o && (o.t === 'ci' || o.t === 'ln' || o.t === 'pg')) {
                       modifiedCurveId = o.id;
                       fixedCenter = false;
                     }
+                  } else if (lockedEdgeCi) {
+                    modifiedCurveId = lockedEdgeCi.id;
+                    fixedCenter = false;
                   } else {
                     const edgeCi = curObjs.find(
                       (o) => !o.dead && o.t === 'ci' && o.p === hitPt!.id
+                    );
+                    const cornerPg = curObjs.find(
+                      (o) => !o.dead && o.t === 'pg' && o.p === hitPt!.id
                     );
                     const lnEnd = curObjs.find(
                       (o) => !o.dead && o.t === 'ln' && (o.a === hitPt!.id || o.b === hitPt!.id)
@@ -1752,9 +2410,23 @@ export default function App() {
                     const centerCi = curObjs.find(
                       (o) => !o.dead && o.t === 'ci' && (o.c === hitPt!.id || o.d1 === hitPt!.id || o.d2 === hitPt!.id)
                     );
-                    if (edgeCi) {
+                    if (edgeCi && edgeCi.t === 'ci') {
                       modifiedCurveId = edgeCi.id;
-                      fixedCenter = true;
+                      fixedCenter = !edgeCi.scaleLocked;
+                    } else if (cornerPg && cornerPg.t === 'pg') {
+                      const pc = getObj(curObjs, cornerPg.c);
+                      if (pc && pc.t === 'pt' && pc.ok) {
+                        const lockedRadius = cornerPg.scaleLocked
+                          ? Math.hypot(hitPt.x - pc.x, hitPt.y - pc.y)
+                          : undefined;
+                        pgCornerEdit = {
+                          polyId: cornerPg.id,
+                          cx: pc.x,
+                          cy: pc.y,
+                          sides: cornerPg.sides,
+                          ...(lockedRadius !== undefined ? { lockedRadius } : {}),
+                        };
+                      }
                     } else if (lnEnd && lnEnd.t === 'ln') {
                       modifiedCurveId = lnEnd.id;
                       anchorEnd = lnEnd.a === hitPt.id ? 'b' : 'a';
@@ -1773,6 +2445,7 @@ export default function App() {
                   modifiedCurveId,
                   fixedCenter,
                   anchorEnd,
+                  pgCornerEdit,
                 };
                 setIsDragging(true);
               }
@@ -1780,7 +2453,9 @@ export default function App() {
               // Direct sliding/editing for tangent-constrained circles without free root points
               const o = getObj(curObjs, hitId);
               if (o && !o.dead && o.t === 'ci') {
-                if (o.tanSet && o.tanSet.length === 2) {
+                if (o.scaleLocked) {
+                  notifyNotice('Escala travada — desbloqueie para alterar o raio.');
+                } else if (o.tanSet && o.tanSet.length === 2) {
                   const cv = curve(curObjs, o, curveCacheRef.current);
                   if (cv && cv.t === 'c') {
                     dragRef.current = {
@@ -1842,12 +2517,14 @@ export default function App() {
           if (bestG) {
             setSelectedGuideId(bestG.id);
             setSelectedIds(new Set());
+            setSelectedShapeIds(new Set());
             guideDragRef.current = {
               id: bestG.id,
               kind: bestG.kind,
               sx: x,
               sy: y,
               orig: { ...bestG },
+              saved: false,
             };
             setIsDragging(true);
             svg.setPointerCapture(e.pointerId);
@@ -1857,24 +2534,12 @@ export default function App() {
 
         setSelectedGuideId(null);
 
-        // 4. Empty canvas click: check reference image handles, Shift+Drag marquee, or pan
+        // 4. Empty canvas click: check reference image handles, otherwise initiate direct marquee selection
         if (!imgDown(x, y)) {
-          if (e.shiftKey) {
-            const box: MarqueeBox = { x0: x, y0: y, x1: x, y1: y };
-            marqueeRef.current = box;
-            setMarquee(box);
-          } else {
-            if (selectedIdsRef.current.size > 0) {
-              setSelectedIds(new Set());
-            }
-            panRef.current = {
-              sx: e.clientX,
-              sy: e.clientY,
-              vx: viewRef.current.x,
-              vy: viewRef.current.y,
-            };
-            setIsPanning(true);
-          }
+          const box: MarqueeBox = { x0: x, y0: y, x1: x, y1: y };
+          marqueeRef.current = box;
+          marqueeShiftRef.current = e.shiftKey;
+          setMarquee(box);
         }
         svg.setPointerCapture(e.pointerId);
         return;
@@ -1906,7 +2571,7 @@ export default function App() {
           return;
         }
         const hitCurve = curObjs.find((o) => {
-          if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci')) return false;
+          if (o.dead || !vis.has(o.id) || (o.t !== 'ln' && o.t !== 'ci' && o.t !== 'pg')) return false;
           const cv = curve(curObjs, o, curveCacheRef.current);
           return cv ? distToCurve(cv, x, y) < 8 / vK : false;
         });
@@ -1969,6 +2634,7 @@ export default function App() {
           }
           if (bestG) {
             const delId = bestG.id;
+            pushHistory(curObjs);
             setGuides((prev) => prev.filter((g) => g.id !== delId));
             if (selectedGuideIdRef.current === delId) setSelectedGuideId(null);
           }
@@ -2004,6 +2670,7 @@ export default function App() {
               x2: sn.x,
               y2: sn.y,
             };
+            pushHistory(curObjs);
             setGuides((prev) => [...prev, newGuide]);
             setGuidesVisible(true);
             setSelectedGuideId(id);
@@ -2020,7 +2687,14 @@ export default function App() {
         return;
       }
 
-      if (curTool === 'ci' && pendRef.current.length === 1 && tgMode) {
+      if (
+        curTool === 'ci' &&
+        (circleModeRef.current === 'center' || circleModeRef.current === 'top-left') &&
+        pendRef.current.length === 1 &&
+        tgMode &&
+        creationOriginRef.current === 'center' &&
+        circleModeRef.current !== 'top-left'
+      ) {
         const tg = tangentFor(
           curObjs,
           pendRef.current[0],
@@ -2035,8 +2709,17 @@ export default function App() {
         if (tg) {
           pushHistory(curObjs);
           const next = cloneObjs(curObjs);
-          const ci = addObj(next, { t: 'ci', c: pendRef.current[0], tan: tg.tan, m: tg.m, phaseId: pid });
+          const ci = addObj(next, {
+            t: 'ci',
+            c: pendRef.current[0],
+            tan: tg.tan,
+            ...(tg.tanEdge !== undefined ? { tanEdge: tg.tanEdge } : {}),
+            m: tg.m,
+            phaseId: pid,
+            ...(gridConfigRef.current.lockScale ? { scaleLocked: true } : {}),
+          });
           addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci, tg: tg.tan, phaseId: pid });
+          recalc(next);
           setObjs(next);
           setPend([]);
           setGhost(null);
@@ -2044,7 +2727,7 @@ export default function App() {
         }
       }
 
-      if (curTool === 'ln' && pendRef.current.length === 1 && tgMode) {
+      if (curTool === 'ln' && lineModeRef.current !== 'common' && pendRef.current.length === 1 && tgMode) {
         const tg = tangentLineFor(
           curObjs,
           pendRef.current[0],
@@ -2059,8 +2742,22 @@ export default function App() {
         if (tg) {
           pushHistory(curObjs);
           const next = cloneObjs(curObjs);
-          const ln = addObj(next, { t: 'ln', a: pendRef.current[0], to: tg.to, s: tg.s, phaseId: pid });
-          addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci: tg.to, tg: ln, phaseId: pid });
+          if (tg.polyVertexIdx !== undefined) {
+            const bId = addObj(next, {
+              t: 'pt',
+              free: false,
+              x: tg.contact.x,
+              y: tg.contact.y,
+              on: tg.to,
+              u: tg.polyVertexIdx,
+              phaseId: pid,
+            });
+            addObj(next, { t: 'ln', a: pendRef.current[0], b: bId, phaseId: pid });
+          } else {
+            const ln = addObj(next, { t: 'ln', a: pendRef.current[0], to: tg.to, s: tg.s, phaseId: pid });
+            addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci: tg.to, tg: ln, phaseId: pid });
+          }
+          recalc(next);
           setObjs(next);
           setPend([]);
           setGhost(null);
@@ -2068,7 +2765,7 @@ export default function App() {
         }
       }
 
-      if (curTool === 'tcir') {
+      if (curTool === 'ci' && circleModeRef.current === 'tangent') {
         const curTan = tanSelRef.current;
         const exclude = new Set(curTan.map((s) => s.id));
         const hitId =
@@ -2076,9 +2773,20 @@ export default function App() {
             ? findTanTargetAt(curObjs, curveCacheRef.current, x, y, vK, exclude)
             : null;
 
+        const resolveHitEdge = (id: number): number | undefined => {
+          const hitObj = getObj(curObjs, id);
+          if (!hitObj || hitObj.t !== 'pg') return undefined;
+          const hitCv = curve(curObjs, hitObj, curveCacheRef.current);
+          return hitCv && hitCv.t === 'p' ? nearestPolyEdge(hitCv, x, y)?.edge : undefined;
+        };
+
         if (curTan.length < 2) {
           if (hitId !== null) {
-            const nextSel: TanTargetSel[] = [...curTan, { id: hitId, hx: x, hy: y }];
+            const edge = resolveHitEdge(hitId);
+            const nextSel: TanTargetSel[] = [
+              ...curTan,
+              { id: hitId, hx: x, hy: y, ...(edge !== undefined ? { edge } : {}) },
+            ];
             tanSelRef.current = nextSel;
             setTanSel(nextSel);
             setTanVariantIdx(0);
@@ -2097,7 +2805,11 @@ export default function App() {
         }
 
         if (hitId !== null && curTan.length < 4) {
-          const nextSel: TanTargetSel[] = [...curTan, { id: hitId, hx: x, hy: y }];
+          const edge = resolveHitEdge(hitId);
+          const nextSel: TanTargetSel[] = [
+            ...curTan,
+            { id: hitId, hx: x, hy: y, ...(edge !== undefined ? { edge } : {}) },
+          ];
           tanSelRef.current = nextSel;
           setTanSel(nextSel);
           setTanVariantIdx(0);
@@ -2113,7 +2825,7 @@ export default function App() {
         return;
       }
 
-      if (curTool === 'tc') {
+      if (curTool === 'ln' && lineModeRef.current === 'common') {
         const curTc = tcSelRef.current;
         if (curTc.length < 2) {
           const hit = curObjs.find((o) => {
@@ -2132,6 +2844,7 @@ export default function App() {
             const ln = addObj(next, { t: 'ln', cc: [curTc[0], curTc[1]], s: g.s, tt: g.t, phaseId: pid });
             addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci: curTc[0], tg: ln, phaseId: pid });
             addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci: curTc[1], tg: ln, phaseId: pid });
+            recalc(next);
             setObjs(next);
             setTcSel([]);
             setGhost(null);
@@ -2140,7 +2853,7 @@ export default function App() {
         return;
       }
 
-      if (curTool === 'cb' && pendRef.current.length === 1 && tgMode) {
+      if (curTool === 'ci' && circleModeRef.current === 'diameter' && pendRef.current.length === 1 && tgMode) {
         const A = getObj(curObjs, pendRef.current[0]);
         if (A && A.t === 'pt' && A.ok) {
           const tg = tanSolve(
@@ -2158,10 +2871,17 @@ export default function App() {
           if (tg) {
             pushHistory(curObjs);
             const next = cloneObjs(curObjs);
-            const ci = addObj(next, { t: 'ci', e: pendRef.current[0], phaseId: pid, ...tanFields(tg) });
+            const ci = addObj(next, {
+              t: 'ci',
+              e: pendRef.current[0],
+              phaseId: pid,
+              ...tanFields(tg),
+              ...(gridConfigRef.current.lockScale ? { scaleLocked: true } : {}),
+            });
             for (const q of tanIds(tg)) {
               addObj(next, { t: 'pt', free: false, x: 0, y: 0, tp: true, ci, tg: q, phaseId: pid });
             }
+            recalc(next);
             setObjs(next);
             setPend([]);
             setGhost(null);
@@ -2172,6 +2892,7 @@ export default function App() {
 
       pushHistory(curObjs);
       const next = cloneObjs(curObjs);
+      const gCfg = gridConfigRef.current;
       const sn = snap(
         next,
         x,
@@ -2183,17 +2904,168 @@ export default function App() {
         cachedIntersRef.current,
         activeGuides,
         curveCacheRef.current,
-        snapIds
+        snapIds,
+        !alt ? gCfg : undefined
       );
-      const id = commitSnap(next, sn, pid);
+
+      if (
+        pendRef.current.length === 1 &&
+        ((curTool === 'ci' && (creationOriginRef.current === 'top-left' || circleModeRef.current === 'top-left')) ||
+          (curTool === 'pg' && creationOriginRef.current === 'top-left'))
+      ) {
+        const p0Id = pendRef.current[0];
+        const anchor = getObj(next, p0Id);
+        if (anchor && anchor.t === 'pt' && anchor.ok) {
+          const dx = sn.x - anchor.x;
+          const dy = sn.y - anchor.y;
+          const sx = dx >= 0 ? 1 : -1;
+          const sy = dy >= 0 ? 1 : -1;
+          const rawBox = Math.max(Math.abs(dx), Math.abs(dy));
+          if (rawBox > 1e-4) {
+            let boxSide = rawBox;
+            if (!alt && gCfg.sizeRule !== 'free' && sn.k === 'free' && !sn.guideTag) {
+              boxSide = snapSizeByRule(rawBox, gCfg).snapped;
+            }
+            const cx = anchor.x + sx * (boxSide / 2);
+            const cy = anchor.y + sy * (boxSide / 2);
+            const usedElsewhere = next.some((q) => !q.dead && refsOf(q).includes(p0Id));
+            let centerPtId: number;
+            if (anchor.free && !usedElsewhere) {
+              anchor.x = cx;
+              anchor.y = cy;
+              centerPtId = p0Id;
+            } else {
+              centerPtId = addObj(next, { t: 'pt', free: true, x: cx, y: cy, phaseId: pid });
+            }
+            const lockNew = gCfg.lockScale;
+            if (curTool === 'ci') {
+              const edgePtId = addObj(next, {
+                t: 'pt',
+                free: true,
+                x: cx + boxSide / 2,
+                y: cy,
+                phaseId: pid,
+              });
+              addObj(next, {
+                t: 'ci',
+                c: centerPtId,
+                p: edgePtId,
+                phaseId: pid,
+                ...(lockNew ? { scaleLocked: true } : {}),
+              });
+            } else {
+              const sides = Math.max(3, polySidesRef.current);
+              const polyR = sides === 4 ? boxSide / Math.SQRT2 : boxSide / 2;
+              const rot = sides === 4 ? Math.PI / 4 : -Math.PI / 2;
+              const cornerPtId = addObj(next, {
+                t: 'pt',
+                free: true,
+                x: cx + polyR * Math.cos(rot),
+                y: cy + polyR * Math.sin(rot),
+                phaseId: pid,
+              });
+              addObj(next, {
+                t: 'pg',
+                c: centerPtId,
+                p: cornerPtId,
+                sides,
+                phaseId: pid,
+                ...(lockNew ? { scaleLocked: true } : {}),
+              });
+            }
+            recalc(next);
+            setObjs(next);
+            setPend([]);
+            setGhost(null);
+            return;
+          }
+        }
+      }
+
+      let finalSnap: SnapResult = sn;
+      if (pendRef.current.length === 1 && sn.k === 'free' && !sn.guideTag) {
+        const anchor = getObj(next, pendRef.current[0]);
+        if (anchor && anchor.t === 'pt' && anchor.ok) {
+          if (curTool === 'ci' && circleModeRef.current === 'diameter' && !alt && gCfg.sizeRule !== 'free') {
+            const rawD = Math.hypot(sn.x - anchor.x, sn.y - anchor.y);
+            if (rawD > 1e-3) {
+              const rule = snapSizeByRule(rawD, gCfg);
+              const ang = Math.atan2(sn.y - anchor.y, sn.x - anchor.x);
+              finalSnap = {
+                k: 'free',
+                x: anchor.x + rule.snapped * Math.cos(ang),
+                y: anchor.y + rule.snapped * Math.sin(ang),
+              };
+            }
+          } else if (curTool === 'ci' && !alt && gCfg.sizeRule !== 'free') {
+            const rawR = Math.hypot(sn.x - anchor.x, sn.y - anchor.y);
+            if (rawR > 1e-3) {
+              const rule = snapSizeByRule(rawR * 2, gCfg);
+              const ang = Math.atan2(sn.y - anchor.y, sn.x - anchor.x);
+              finalSnap = {
+                k: 'free',
+                x: anchor.x + (rule.snapped / 2) * Math.cos(ang),
+                y: anchor.y + (rule.snapped / 2) * Math.sin(ang),
+              };
+            }
+          } else if (curTool === 'pg') {
+            const polySnap = resolvePolyCorner(
+              anchor.x,
+              anchor.y,
+              sn.x,
+              sn.y,
+              true,
+              Math.max(3, polySidesRef.current),
+              e.shiftKey,
+              alt,
+              effSnap,
+              gCfg
+            );
+            if (polySnap) {
+              finalSnap = {
+                k: 'free',
+                x: polySnap.px,
+                y: polySnap.py,
+              };
+            }
+          }
+        }
+      }
+      const id = commitSnap(next, finalSnap, pid);
 
       const nextPend = [...pendRef.current, id];
       if (nextPend.length === 2) {
         if (nextPend[0] !== nextPend[1]) {
+          const lockNew = gCfg.lockScale;
           if (curTool === 'ln') addObj(next, { t: 'ln', a: nextPend[0], b: nextPend[1], phaseId: pid });
-          else if (curTool === 'cb') addObj(next, { t: 'ci', d1: nextPend[0], d2: nextPend[1], phaseId: pid });
-          else addObj(next, { t: 'ci', c: nextPend[0], p: nextPend[1], phaseId: pid });
+          else if (curTool === 'ci' && circleModeRef.current === 'diameter') {
+            addObj(next, {
+              t: 'ci',
+              d1: nextPend[0],
+              d2: nextPend[1],
+              phaseId: pid,
+              ...(lockNew ? { scaleLocked: true } : {}),
+            });
+          } else if (curTool === 'pg') {
+            addObj(next, {
+              t: 'pg',
+              c: nextPend[0],
+              p: nextPend[1],
+              sides: Math.max(3, polySidesRef.current),
+              phaseId: pid,
+              ...(lockNew ? { scaleLocked: true } : {}),
+            });
+          } else {
+            addObj(next, {
+              t: 'ci',
+              c: nextPend[0],
+              p: nextPend[1],
+              phaseId: pid,
+              ...(lockNew ? { scaleLocked: true } : {}),
+            });
+          }
         }
+        recalc(next);
         setObjs(next);
         setPend([]);
         setGhost(null);
@@ -2211,6 +3083,7 @@ export default function App() {
       isObjLocked,
       isPhaseLocked,
       notifyLocked,
+      notifyNotice,
       pushHistory,
       spaceDown,
       togglePrioAt,
@@ -2291,6 +3164,10 @@ export default function App() {
         const vK = viewRef.current.k;
         const dx = x - gd.sx;
         const dy = y - gd.sy;
+        if (!gd.saved && (Math.abs(dx) > 1e-6 || Math.abs(dy) > 1e-6)) {
+          pushHistory(objsRef.current);
+          gd.saved = true;
+        }
         const allowSnap = snapEnabledRef.current && !altKey;
         const tol = snapPxRef.current / vK;
 
@@ -2340,7 +3217,12 @@ export default function App() {
         if (dr.kind === 'resize') {
           const delta = (x - dr.sx) * dr.ux + (y - dr.sy) * dr.uy;
           const vK = viewRef.current.k;
-          const newR = Math.max(2 / vK, dr.origR + (dr.isTanOffset ? delta * 0.5 : delta));
+          const rawR = Math.max(2 / vK, dr.origR + (dr.isTanOffset ? delta * 0.5 : delta));
+          const gCfg = gridConfigRef.current;
+          const newR =
+            !altKey && gCfg.sizeRule !== 'free'
+              ? Math.max(2 / vK, snapSizeByRule(rawR * 2, gCfg).snapped / 2)
+              : rawR;
           if (!dr.saved && Math.abs(delta) > 1e-6) {
             pushHistory(dr.baseObjs);
             dr.saved = true;
@@ -2401,6 +3283,12 @@ export default function App() {
             dr.saved = true;
           }
           const next = cloneObjs(curObjs);
+          const gCfg = gridConfigRef.current;
+          const vK = viewRef.current.k;
+          const curSnapPx = snapPxRef.current;
+          const allowGridSnap = !altKey && gCfg.enabled && gCfg.snap;
+          let gridHover: SnapResult | null = null;
+
           for (const orig of dr.origins) {
             const pt = next[orig.id];
             if (pt && pt.t === 'pt' && pt.free) {
@@ -2408,21 +3296,79 @@ export default function App() {
               pt.y = orig.y + dy;
             }
           }
+
+          if (dr.pgCornerEdit && dr.origins.length === 1) {
+            const pgInfo = dr.pgCornerEdit;
+            const curPt = next[dr.origins[0].id];
+            if (curPt && curPt.t === 'pt' && curPt.free) {
+              if (pgInfo.lockedRadius !== undefined) {
+                const polySnap = resolvePolyCorner(
+                  pgInfo.cx,
+                  pgInfo.cy,
+                  curPt.x,
+                  curPt.y,
+                  true,
+                  pgInfo.sides,
+                  shiftKey,
+                  true,
+                  false,
+                  gCfg
+                );
+                const tx = polySnap ? polySnap.px : curPt.x;
+                const ty = polySnap ? polySnap.py : curPt.y;
+                const ang = Math.atan2(ty - pgInfo.cy, tx - pgInfo.cx);
+                curPt.x = pgInfo.cx + pgInfo.lockedRadius * Math.cos(ang);
+                curPt.y = pgInfo.cy + pgInfo.lockedRadius * Math.sin(ang);
+              } else {
+                const gs = allowGridSnap ? snapToGrid(curPt.x, curPt.y, vK, curSnapPx, gCfg) : null;
+                if (gs) {
+                  curPt.x = gs.x;
+                  curPt.y = gs.y;
+                  gridHover = { k: 'free', x: gs.x, y: gs.y, guideTag: gs.tag };
+                } else {
+                  const polySnap = resolvePolyCorner(
+                    pgInfo.cx,
+                    pgInfo.cy,
+                    curPt.x,
+                    curPt.y,
+                    true,
+                    pgInfo.sides,
+                    shiftKey,
+                    altKey,
+                    snapEnabledRef.current && !altKey,
+                    gCfg
+                  );
+                  if (polySnap) {
+                    curPt.x = polySnap.px;
+                    curPt.y = polySnap.py;
+                  }
+                }
+              }
+            }
+          }
           recalc(next);
-          if (dr.modifiedCurveId !== undefined && Math.hypot(dx, dy) > 1e-6) {
+
+          let activeTanApplied = false;
+          if (
+            tanSnapEnabledRef.current &&
+            dr.modifiedCurveId !== undefined &&
+            Math.hypot(dx, dy) > 1e-6
+          ) {
             const snapRes = findDragTangencySnap(next, dr.modifiedCurveId, {
               fixedCenter: dr.fixedCenter,
               anchorEnd: dr.anchorEnd,
               cursorX: x,
               cursorY: y,
-              viewK: viewRef.current.k,
-              snapPx: snapPxRef.current,
+              viewK: vK,
+              snapPx: curSnapPx,
               allowedIds: allowedSnapIdsRef.current,
             });
             const allowTanSnap = snapEnabledRef.current && !altKey;
             if (allowTanSnap && snapRes.active) {
               applyDragTangencySnap(next, snapRes.active);
               activeDragTanRef.current = snapRes.active;
+              activeTanApplied = true;
+              gridHover = null;
               setDragTanOverlay({ candidates: snapRes.candidates, active: snapRes.active });
             } else {
               activeDragTanRef.current = null;
@@ -2436,6 +3382,82 @@ export default function App() {
             activeDragTanRef.current = null;
             setDragTanOverlay(null);
           }
+
+          if (
+            !activeTanApplied &&
+            allowGridSnap &&
+            !dr.pgCornerEdit &&
+            dr.origins.length > 0 &&
+            (dr.origins.length === 1 || dr.modifiedCurveId !== undefined)
+          ) {
+            const refOrig = dr.origins[0];
+            const gs = snapToGrid(refOrig.x + dx, refOrig.y + dy, vK, curSnapPx, gCfg);
+            if (gs) {
+              const sdx = gs.x - refOrig.x;
+              const sdy = gs.y - refOrig.y;
+              for (const orig of dr.origins) {
+                const pt = next[orig.id];
+                if (pt && pt.t === 'pt' && pt.free) {
+                  pt.x = orig.x + sdx;
+                  pt.y = orig.y + sdy;
+                }
+              }
+              recalc(next);
+              gridHover = { k: 'free', x: gs.x, y: gs.y, guideTag: gs.tag };
+            }
+          }
+
+          let nextSmartGuides: SmartGuide[] = [];
+          if (
+            !activeTanApplied &&
+            !gridHover &&
+            snapEnabledRef.current &&
+            !altKey &&
+            !dr.pgCornerEdit
+          ) {
+            const movingIds = new Set<number>();
+            if (dr.modifiedCurveId !== undefined) movingIds.add(dr.modifiedCurveId);
+            for (const id of selectedIdsRef.current) {
+              const o = getObj(next, id);
+              if (o && !o.dead && (o.t === 'ci' || o.t === 'pg' || o.t === 'ln')) {
+                movingIds.add(o.id);
+              }
+            }
+            for (const o of next) {
+              if (o.dead || (o.t !== 'ci' && o.t !== 'pg' && o.t !== 'ln')) continue;
+              const rs = refsOf(o);
+              if (dr.origins.some((orig) => rs.includes(orig.id))) {
+                movingIds.add(o.id);
+              }
+            }
+            const moveBoundIds =
+              movingIds.size > 0 ? movingIds : new Set(dr.origins.map((o) => o.id));
+            const movedBounds = getSelectionBoundingBox(next, moveBoundIds);
+            if (movedBounds) {
+              const sg = findSmartAlignSnap(
+                next,
+                movingIds,
+                movedBounds,
+                vK,
+                curSnapPx,
+                allowedSnapIdsRef.current
+              );
+              if (sg.dx !== 0 || sg.dy !== 0) {
+                for (const orig of dr.origins) {
+                  const pt = next[orig.id];
+                  if (pt && pt.t === 'pt' && pt.free) {
+                    pt.x += sg.dx;
+                    pt.y += sg.dy;
+                  }
+                }
+                recalc(next);
+              }
+              nextSmartGuides = sg.guides;
+            }
+          }
+
+          setSmartGuides(nextSmartGuides);
+          setHover(gridHover);
           setObjs(next);
           return;
         }
@@ -2664,55 +3686,131 @@ export default function App() {
 
       if (marqueeRef.current) {
         const box = marqueeRef.current;
-        const minX = Math.min(box.x0, box.x1);
-        const maxX = Math.max(box.x0, box.x1);
-        const minY = Math.min(box.y0, box.y1);
-        const maxY = Math.max(box.y0, box.y1);
-        const curObjs = objsRef.current;
-        const cCache = curveCacheRef.current;
-        const vis = visibleHitIdsRef.current;
-        const picked = new Set<number>();
+        const vK = viewRef.current.k;
+        const isClickOnly = Math.hypot((box.x1 - box.x0) * vK, (box.y1 - box.y0) * vK) < 4;
+        const shiftMerge = marqueeShiftRef.current;
 
-        for (const o of curObjs) {
-          if (o.dead || !vis.has(o.id)) continue;
-          if (o.t === 'pt' && o.ok) {
-            if (o.x >= minX && o.x <= maxX && o.y >= minY && o.y <= maxY) {
-              picked.add(o.id);
-            }
-          } else if (o.t === 'ci') {
-            const cv = curve(curObjs, o, cCache);
-            if (cv && cv.t === 'c') {
-              if (cv.x + cv.r >= minX && cv.x - cv.r <= maxX && cv.y + cv.r >= minY && cv.y - cv.r <= maxY) {
-                if (cv.x >= minX && cv.x <= maxX && cv.y >= minY && cv.y <= maxY) {
-                  picked.add(o.id);
+        if (isClickOnly) {
+          let hitShape: BuiltShape | undefined;
+          const visibleShapes = shapesRef.current.filter((sh) => {
+            if (!sh.d) return false;
+            const ph = phaseMapRef.current.get(sh.phaseId);
+            return ph ? ph.showPath : true;
+          });
+          if (visibleShapes.length > 0 && typeof Path2D !== 'undefined') {
+            const orderMap = new Map(phasesRef.current.map((p, idx) => [p.id, idx]));
+            const orderedShapes = [...visibleShapes].sort(
+              (a, b) => (orderMap.get(b.phaseId) ?? 0) - (orderMap.get(a.phaseId) ?? 0)
+            );
+            const testCanvas = document.createElement('canvas');
+            const testCtx = testCanvas.getContext('2d');
+            if (testCtx) {
+              for (const sh of orderedShapes) {
+                try {
+                  if (testCtx.isPointInPath(new Path2D(sh.d), box.x0, box.y0, 'evenodd')) {
+                    hitShape = sh;
+                    break;
+                  }
+                } catch {
+                  // ignore malformed path
                 }
               }
             }
-          } else if (o.t === 'ln' && o.a !== undefined && o.b !== undefined) {
-            const pa = getObj(curObjs, o.a);
-            const pb = getObj(curObjs, o.b);
-            if (
-              pa &&
-              pb &&
-              pa.t === 'pt' &&
-              pb.t === 'pt' &&
-              pa.ok &&
-              pb.ok &&
-              pa.x >= minX &&
-              pa.x <= maxX &&
-              pa.y >= minY &&
-              pa.y <= maxY &&
-              pb.x >= minX &&
-              pb.x <= maxX &&
-              pb.y >= minY &&
-              pb.y <= maxY
-            ) {
-              picked.add(o.id);
+          }
+
+          if (hitShape) {
+            if (shiftMerge) {
+              setSelectedShapeIds((prev) => {
+                const next = new Set(prev);
+                if (next.has(hitShape!.id)) next.delete(hitShape!.id);
+                else next.add(hitShape!.id);
+                return next;
+              });
+            } else {
+              setSelectedShapeIds(new Set([hitShape.id]));
+              setSelectedIds(new Set());
             }
+          } else if (!shiftMerge) {
+            setSelectedIds(new Set());
+            setSelectedShapeIds(new Set());
+          }
+        } else {
+          const minX = Math.min(box.x0, box.x1);
+          const maxX = Math.max(box.x0, box.x1);
+          const minY = Math.min(box.y0, box.y1);
+          const maxY = Math.max(box.y0, box.y1);
+          const curObjs = objsRef.current;
+          const cCache = curveCacheRef.current;
+          const vis = visibleHitIdsRef.current;
+          const picked = new Set<number>(shiftMerge ? selectedIdsRef.current : []);
+
+          for (const o of curObjs) {
+            if (o.dead || !vis.has(o.id)) continue;
+            if (o.t === 'pt' && o.ok) {
+              if (o.x >= minX && o.x <= maxX && o.y >= minY && o.y <= maxY) {
+                picked.add(o.id);
+              }
+            } else if (o.t === 'ci') {
+              const cv = curve(curObjs, o, cCache);
+              if (cv && cv.t === 'c') {
+                if (cv.x + cv.r >= minX && cv.x - cv.r <= maxX && cv.y + cv.r >= minY && cv.y - cv.r <= maxY) {
+                  if (cv.x >= minX && cv.x <= maxX && cv.y >= minY && cv.y <= maxY) {
+                    picked.add(o.id);
+                  }
+                }
+              }
+            } else if (o.t === 'pg') {
+              const cv = curve(curObjs, o, cCache);
+              if (cv && cv.t === 'p') {
+                if (cv.cx >= minX && cv.cx <= maxX && cv.cy >= minY && cv.cy <= maxY) {
+                  picked.add(o.id);
+                }
+              }
+            } else if (o.t === 'ln' && o.a !== undefined && o.b !== undefined) {
+              const pa = getObj(curObjs, o.a);
+              const pb = getObj(curObjs, o.b);
+              if (
+                pa &&
+                pb &&
+                pa.t === 'pt' &&
+                pb.t === 'pt' &&
+                pa.ok &&
+                pb.ok &&
+                pa.x >= minX &&
+                pa.x <= maxX &&
+                pa.y >= minY &&
+                pa.y <= maxY &&
+                pb.x >= minX &&
+                pb.x <= maxX &&
+                pb.y >= minY &&
+                pb.y <= maxY
+              ) {
+                picked.add(o.id);
+              }
+            }
+          }
+
+          // Expand any selected grouped object to all visible members of its group
+          const pickedGroups = new Set<string>();
+          for (const pid of picked) {
+            const po = getObj(curObjs, pid);
+            if (po?.groupId) pickedGroups.add(po.groupId);
+          }
+          if (pickedGroups.size > 0) {
+            for (const o of curObjs) {
+              if (!o.dead && vis.has(o.id) && o.groupId && pickedGroups.has(o.groupId)) {
+                picked.add(o.id);
+              }
+            }
+          }
+
+          setSelectedIds(picked);
+          if (!shiftMerge) {
+            setSelectedShapeIds(new Set());
           }
         }
 
-        setSelectedIds(picked);
+        marqueeShiftRef.current = false;
         marqueeRef.current = null;
         setMarquee(null);
       }
@@ -2720,16 +3818,20 @@ export default function App() {
       if (activeDragTanRef.current) {
         const cand = activeDragTanRef.current;
         activeDragTanRef.current = null;
-        const next = cloneObjs(objsRef.current);
-        applyDragTangencySnap(next, cand);
-        applyTangencyConnection(next, cand);
-        setObjs(next);
+        if (tanSnapEnabledRef.current) {
+          const next = cloneObjs(objsRef.current);
+          applyDragTangencySnap(next, cand);
+          applyTangencyConnection(next, cand);
+          setObjs(next);
+        }
       }
 
       dragRef.current = null;
       panRef.current = null;
       imgDragRef.current = null;
+      setHover(null);
       setDragTanOverlay(null);
+      setSmartGuides([]);
       setIsPanning(false);
       setIsDragging(false);
     },
@@ -2752,6 +3854,10 @@ export default function App() {
       if (!hit) return;
       if (isObjLocked(curObjs, hit.id)) {
         notifyLocked(hit.phaseId);
+        return;
+      }
+      if (hit.t === 'ci' && hit.scaleLocked) {
+        notifyNotice('Escala travada — desbloqueie para alterar o raio.');
         return;
       }
       const C = curve(curObjs, hit, cCache);
@@ -2779,7 +3885,7 @@ export default function App() {
       setGhost(null);
       setHover(null);
     },
-    [isObjLocked, notifyLocked, toWorld]
+    [isObjLocked, notifyLocked, notifyNotice, toWorld]
   );
 
   const zoomBy = useCallback((f: number) => {
@@ -2854,10 +3960,34 @@ export default function App() {
     [loadImageSrc]
   );
 
-  // Paste handler: prioritizes clipboard image if present, otherwise pastes copied geometry
+  // Paste handler: prioritizes our own copied geometry payload, then clipboard image, then in-memory geometry
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      lastNativePasteAtRef.current = Date.now();
+      const text = e.clipboardData?.getData('text/plain') ?? '';
+      if (text.startsWith('compasso-geom:')) {
+        try {
+          const parsed = JSON.parse(text.slice('compasso-geom:'.length)) as CopiedSubgraph;
+          if (parsed && Array.isArray(parsed.items) && parsed.anchor) {
+            copiedRef.current = parsed;
+            setHasClipboard(true);
+          }
+        } catch {
+          // fall back to in-memory copiedRef
+        }
+        if (copiedRef.current) {
+          e.preventDefault();
+          pasteClipboard(false);
+          return;
+        }
+      }
       const items = e.clipboardData?.items;
       if (items) {
         for (const it of items) {
@@ -2878,8 +4008,56 @@ export default function App() {
     return () => window.removeEventListener('paste', onPaste);
   }, [handleUploadImage, pasteClipboard]);
 
+  const handleChangeGridConfig = useCallback((patch: Partial<GridConfig>) => {
+    setGridConfig((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const handleCenterGridOrigin = useCallback(() => {
+    const v = viewRef.current;
+    const { w, h } = sizeRef.current;
+    setGridConfig((prev) => ({
+      ...prev,
+      originX: v.x + w / (2 * v.k),
+      originY: v.y + h / (2 * v.k),
+    }));
+  }, []);
+
+  const handleGenerateFibGeometry = useCallback(
+    (mode: 'squares' | 'circles' | 'both') => {
+      const pid = activePhaseIdRef.current;
+      if (isPhaseLocked(pid)) {
+        notifyLocked(pid);
+        return;
+      }
+      const tiles = computeFibonacciTiles(gridConfigRef.current);
+      if (tiles.length === 0) return;
+      pushHistory(objsRef.current);
+      const next = cloneObjs(objsRef.current);
+      const createdIds: number[] = [];
+      for (const t of tiles) {
+        const cId = addObj(next, { t: 'pt', free: true, x: t.cx, y: t.cy, phaseId: pid });
+        if (mode === 'squares' || mode === 'both') {
+          const pId = addObj(next, { t: 'pt', free: true, x: t.x + t.size, y: t.y + t.size, phaseId: pid });
+          const pgId = addObj(next, { t: 'pg', c: cId, p: pId, sides: 4, phaseId: pid, scaleLocked: true });
+          createdIds.push(pgId);
+        }
+        if (mode === 'circles' || mode === 'both') {
+          const rPtId = addObj(next, { t: 'pt', free: true, x: t.cx + t.size / 2, y: t.cy, phaseId: pid });
+          const ciId = addObj(next, { t: 'ci', c: cId, p: rPtId, phaseId: pid, scaleLocked: true });
+          createdIds.push(ciId);
+        }
+      }
+      setObjs(next);
+      setSelectedIds(new Set(createdIds));
+      setTool('move');
+      setShowGridPanel(false);
+    },
+    [isPhaseLocked, notifyLocked, pushHistory]
+  );
+
   const selectTool = useCallback((nextTool: ToolId) => {
     setTool(nextTool);
+    setAlignPopoverOpen(false);
     setEdit(null);
     setPend([]);
     setTcSel([]);
@@ -2888,6 +4066,7 @@ export default function App() {
     setHoveredSelTanCand(null);
     setHoveredResizeGrip(false);
     setDragTanOverlay(null);
+    setSmartGuides([]);
     activeDragTanRef.current = null;
     setTanVariantIdx(0);
     setTanVariantCount(0);
@@ -2900,6 +4079,70 @@ export default function App() {
     setHoveredGuideKind(null);
     setEditingDim(null);
     setDimError(null);
+    if (nextTool !== 'move') {
+      setSelectedShapeIds(new Set());
+    }
+  }, []);
+
+  const handleChangeLineMode = useCallback((nextMode: LineToolMode) => {
+    setLineMode(nextMode);
+    lineModeRef.current = nextMode;
+    setPend([]);
+    setTcSel([]);
+    setGhost(null);
+    setHover(null);
+    if (nextMode === 'tangent') {
+      setTgOn(true);
+      setTanSnapEnabled(true);
+    } else {
+      setTgOn(false);
+    }
+  }, []);
+
+  const handleChangeCircleMode = useCallback((nextMode: CircleToolMode) => {
+    setCircleMode(nextMode);
+    circleModeRef.current = nextMode;
+    setPend([]);
+    setTanSel([]);
+    setHoveredTanTarget(null);
+    setTanVariantIdx(0);
+    setTanVariantCount(0);
+    setGhost(null);
+    setHover(null);
+    if (nextMode === 'top-left') {
+      setCreationOrigin('top-left');
+      creationOriginRef.current = 'top-left';
+    } else if (nextMode === 'center') {
+      setCreationOrigin('center');
+      creationOriginRef.current = 'center';
+    }
+  }, []);
+
+  const handleChangeCreationOrigin = useCallback((origin: CreationOrigin) => {
+    setCreationOrigin(origin);
+    creationOriginRef.current = origin;
+    if (circleModeRef.current === 'center' || circleModeRef.current === 'top-left') {
+      const nextCm: CircleToolMode = origin === 'top-left' ? 'top-left' : 'center';
+      setCircleMode(nextCm);
+      circleModeRef.current = nextCm;
+    }
+  }, []);
+
+  const handleToggleTg = useCallback(() => {
+    setTgOn((prev) => {
+      const nextVal = !prev;
+      if (nextVal) setTanSnapEnabled(true);
+      if (toolRef.current === 'ln') {
+        if (nextVal && lineModeRef.current === 'free') {
+          setLineMode('tangent');
+          lineModeRef.current = 'tangent';
+        } else if (!nextVal && lineModeRef.current === 'tangent') {
+          setLineMode('free');
+          lineModeRef.current = 'free';
+        }
+      }
+      return nextVal;
+    });
   }, []);
 
   const handleSelectPhase = useCallback((id: string) => {
@@ -3090,18 +4333,32 @@ export default function App() {
 
   const handleStartTanFromSelection = useCallback(() => {
     const targets: TanTargetSel[] = [];
+    const [wx, wy] = lastWorldRef.current;
     for (const id of selectedIdsRef.current) {
       if (targets.length >= 4) break;
       const o = getObj(objsRef.current, id);
-      if (!o || o.dead || (o.t !== 'ci' && o.t !== 'ln')) continue;
+      if (!o || o.dead || (o.t !== 'ci' && o.t !== 'ln' && o.t !== 'pg')) continue;
       const cv = curve(objsRef.current, o, curveCacheRef.current);
       if (!cv) continue;
-      targets.push({ id, hx: cv.x, hy: cv.y });
+      if (cv.t === 'p') {
+        const near = nearestPolyEdge(cv, wx, wy);
+        targets.push({
+          id,
+          hx: near ? near.line.x : cv.cx,
+          hy: near ? near.line.y : cv.cy,
+          edge: near?.edge ?? 0,
+        });
+      } else {
+        targets.push({ id, hx: cv.x, hy: cv.y });
+      }
     }
     if (targets.length < 2) return;
     setSelectedIds(new Set());
-    setTool('tcir');
-    toolRef.current = 'tcir';
+    setSelectedShapeIds(new Set());
+    setTool('ci');
+    toolRef.current = 'ci';
+    setCircleMode('tangent');
+    circleModeRef.current = 'tangent';
     tanSelRef.current = targets;
     setTanSel(targets);
     setTanVariantIdx(0);
@@ -3119,6 +4376,7 @@ export default function App() {
     (dx: number, dy: number) => {
       if (selectedGuideIdRef.current && !guidesLockedRef.current) {
         const gid = selectedGuideIdRef.current;
+        pushHistory(objsRef.current);
         setGuides((prev) =>
           prev.map((g) => {
             if (g.id !== gid) return g;
@@ -3175,32 +4433,43 @@ export default function App() {
         setSpaceDown(true);
         e.preventDefault();
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      const kl = e.key.toLowerCase();
+      if ((e.ctrlKey || e.metaKey) && (kl === 'z' || e.code === 'KeyZ')) {
         e.preventDefault();
         if (e.shiftKey) redoF();
         else undo();
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+      if ((e.ctrlKey || e.metaKey) && (kl === 'y' || e.code === 'KeyY')) {
         e.preventDefault();
         redoF();
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+      if ((e.ctrlKey || e.metaKey) && (kl === 'c' || e.code === 'KeyC')) {
         if (selectedIdsRef.current.size > 0) {
           e.preventDefault();
           copySelected();
         }
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd') {
+      if ((e.ctrlKey || e.metaKey) && (kl === 'v' || e.code === 'KeyV')) {
+        // Fallback for browsers/iframes that block native `paste` events when no input is focused
+        const pressedAt = Date.now();
+        window.setTimeout(() => {
+          if (lastNativePasteAtRef.current < pressedAt - 50 && copiedRef.current) {
+            pasteClipboard(false);
+          }
+        }, 45);
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && (kl === 'd' || e.code === 'KeyD')) {
         if (selectedIdsRef.current.size > 0) {
           e.preventDefault();
           duplicateSelected();
         }
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+      if ((e.ctrlKey || e.metaKey) && (kl === 'a' || e.code === 'KeyA')) {
         e.preventDefault();
         const vis = visibleHitIdsRef.current;
         const all = new Set<number>();
@@ -3223,18 +4492,34 @@ export default function App() {
         nudgeSelection(dx, dy);
         return;
       }
-      if (e.key === 'Enter' && toolRef.current === 'tcir' && tanSelRef.current.length >= 2 && !editingDimRef.current) {
+      if (
+        e.key === 'Enter' &&
+        toolRef.current === 'ci' &&
+        circleModeRef.current === 'tangent' &&
+        tanSelRef.current.length >= 2 &&
+        !editingDimRef.current
+      ) {
         e.preventDefault();
         handleCreateTanCircle();
         return;
       }
-      if (e.key === 'Tab' && toolRef.current === 'tcir' && tanSelRef.current.length >= 2) {
+      if (
+        e.key === 'Tab' &&
+        toolRef.current === 'ci' &&
+        circleModeRef.current === 'tangent' &&
+        tanSelRef.current.length >= 2
+      ) {
         e.preventDefault();
         handleCycleTanVariant();
         return;
       }
       if ((e.key === 'Delete' || e.key === 'Backspace') && !editRef.current) {
-        if (toolRef.current === 'tcir' && tanSelRef.current.length > 0 && selectedIdsRef.current.size === 0) {
+        if (
+          toolRef.current === 'ci' &&
+          circleModeRef.current === 'tangent' &&
+          tanSelRef.current.length > 0 &&
+          selectedIdsRef.current.size === 0
+        ) {
           e.preventDefault();
           const nextSel = tanSelRef.current.slice(0, -1);
           tanSelRef.current = nextSel;
@@ -3248,9 +4533,15 @@ export default function App() {
           deleteSelected();
           return;
         }
+        if (selectedShapeIdsRef.current.size > 0) {
+          e.preventDefault();
+          handleDeleteSelectedShapes();
+          return;
+        }
         if (selectedGuideIdRef.current && !guidesLockedRef.current) {
           e.preventDefault();
           const delId = selectedGuideIdRef.current;
+          pushHistory(objsRef.current);
           setGuides((prev) => prev.filter((g) => g.id !== delId));
           setSelectedGuideId(null);
           return;
@@ -3258,19 +4549,33 @@ export default function App() {
       }
       if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         const k = e.key.toLowerCase();
-        const map: Record<string, ToolId> = {
-          v: 'move',
-          l: 'ln',
-          c: 'ci',
-          b: 'cb',
-          t: 'tc',
-          a: 'tcir',
-          f: 'shape',
-          u: 'ruler',
-          x: 'del',
-        };
-        if (map[k]) {
-          selectTool(map[k]);
+        if (k === 'v') {
+          selectTool('move');
+        } else if (k === 'l') {
+          selectTool('ln');
+          handleChangeLineMode('free');
+        } else if (k === 't') {
+          selectTool('ln');
+          handleChangeLineMode('common');
+        } else if (k === 'c') {
+          selectTool('ci');
+          if (circleModeRef.current === 'diameter' || circleModeRef.current === 'tangent') {
+            handleChangeCircleMode(creationOriginRef.current === 'top-left' ? 'top-left' : 'center');
+          }
+        } else if (k === 'b') {
+          selectTool('ci');
+          handleChangeCircleMode('diameter');
+        } else if (k === 'a') {
+          selectTool('ci');
+          handleChangeCircleMode('tangent');
+        } else if (k === 'q') {
+          selectTool('pg');
+        } else if (k === 'f') {
+          selectTool('shape');
+        } else if (k === 'u') {
+          selectTool('ruler');
+        } else if (k === 'x') {
+          selectTool('del');
         } else if (k === '[') {
           const curPh = phasesRef.current;
           const idx = curPh.findIndex((p) => p.id === activePhaseIdRef.current);
@@ -3280,9 +4585,17 @@ export default function App() {
           const idx = curPh.findIndex((p) => p.id === activePhaseIdRef.current);
           if (idx >= 0 && idx + 1 < curPh.length) handleSelectPhase(curPh[idx + 1].id);
         } else if (k === 's') {
-          setTgOn((prev) => !prev);
+          handleToggleTg();
         } else if (k === 'g') {
           setSnapEnabled((prev) => !prev);
+        } else if (k === 'e') {
+          setTanSnapEnabled((prev) => !prev);
+        } else if (k === 'h') {
+          setShowGridPanel((prev) => {
+            const nextVal = !prev;
+            if (nextVal) setShowHelp(false);
+            return nextVal;
+          });
         } else if (k === 'r') {
           setShowRulers((prev) => !prev);
         } else if (k === 'k') {
@@ -3296,7 +4609,11 @@ export default function App() {
         } else if (k === '-') {
           zoomBy(1 / 1.4);
         } else if (k === '?') {
-          setShowHelp((prev) => !prev);
+          setShowHelp((prev) => {
+            const nextVal = !prev;
+            if (nextVal) setShowGridPanel(false);
+            return nextVal;
+          });
         }
       }
       if (e.key === 'Escape') {
@@ -3307,6 +4624,7 @@ export default function App() {
           tcSelRef.current.length === 0 &&
           tanSelRef.current.length === 0 &&
           selectedIdsRef.current.size === 0 &&
+          selectedShapeIdsRef.current.size === 0 &&
           !rulerStartRef.current &&
           !editingDimRef.current
         ) {
@@ -3314,10 +4632,13 @@ export default function App() {
           setPrioMode(false);
         }
         setSelectedIds(new Set());
+        setSelectedShapeIds(new Set());
+        setAlignPopoverOpen(false);
         setSelectedGuideId(null);
         setHoveredSelTanCand(null);
         setHoveredResizeGrip(false);
         setDragTanOverlay(null);
+        setSmartGuides([]);
         activeDragTanRef.current = null;
         setEdit(null);
         setPend([]);
@@ -3334,6 +4655,7 @@ export default function App() {
         setEditingDim(null);
         setDimError(null);
         setShowHelp(false);
+        setShowGridPanel(false);
       }
     };
 
@@ -3366,10 +4688,16 @@ export default function App() {
     cycleDimMode,
     deleteSelected,
     duplicateSelected,
+    handleChangeCircleMode,
+    handleChangeLineMode,
     handleCreateTanCircle,
     handleCycleTanVariant,
+    handleDeleteSelectedShapes,
     handleSelectPhase,
+    handleToggleTg,
     nudgeSelection,
+    pasteClipboard,
+    pushHistory,
     redoF,
     selectTool,
     undo,
@@ -3392,11 +4720,13 @@ export default function App() {
     setHoveredSelTanCand(null);
     setHoveredResizeGrip(false);
     setDragTanOverlay(null);
+    setSmartGuides([]);
     activeDragTanRef.current = null;
     setTanVariantIdx(0);
     setTanVariantCount(0);
     setEdit(null);
     setSelectedIds(new Set());
+    setSelectedShapeIds(new Set());
     setPrio(new Set());
     setGhost(null);
     setRulerStart(null);
@@ -3416,11 +4746,13 @@ export default function App() {
     setHoveredSelTanCand(null);
     setHoveredResizeGrip(false);
     setDragTanOverlay(null);
+    setSmartGuides([]);
     activeDragTanRef.current = null;
     setTanVariantIdx(0);
     setTanVariantCount(0);
     setEdit(null);
     setSelectedIds(new Set());
+    setSelectedShapeIds(new Set());
     setPrio(new Set());
     setGhost(null);
     setRulerStart(null);
@@ -3457,7 +4789,7 @@ export default function App() {
         sizeRef.current.h,
         withBg,
         overlap,
-        { phases: phasesRef.current, shapes: shapesRef.current }
+        { phases: phasesRef.current, shapes: shapesRef.current, layers: svgExportLayers }
       );
       const url = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }));
       const a = document.createElement('a');
@@ -3466,7 +4798,7 @@ export default function App() {
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 2000);
     },
-    [svgOverlap]
+    [svgExportLayers, svgOverlap]
   );
 
   const interCount = useMemo(
@@ -3482,24 +4814,32 @@ export default function App() {
       <Toolbar
         tool={tool}
         onSelectTool={selectTool}
-        tgActive={tgOn}
-        shiftDown={shiftDown}
-        onToggleTg={() => setTgOn((p) => !p)}
         prioMode={prioMode}
         backquoteDown={backquoteDown}
         onTogglePrioMode={() => setPrioMode((p) => !p)}
         snapEnabled={snapEnabled}
         onToggleSnap={() => setSnapEnabled((p) => !p)}
+        tanSnapEnabled={tanSnapEnabled}
+        onToggleTanSnap={() => setTanSnapEnabled((p) => !p)}
         snapPx={snapPx}
         onChangeSnapPx={setSnapPx}
         showRulers={showRulers}
         onToggleRulers={() => setShowRulers((p) => !p)}
-        guidesLocked={guidesLocked}
-        onToggleGuidesLocked={() => setGuidesLocked((p) => !p)}
+        gridConfig={gridConfig}
+        showGridPanel={showGridPanel}
+        onToggleGridPanel={() => {
+          setShowGridPanel((p) => {
+            const nextVal = !p;
+            if (nextVal) setShowHelp(false);
+            return nextVal;
+          });
+        }}
         dimMode={dimMode}
         onCycleDimMode={cycleDimMode}
         svgOverlap={svgOverlap}
         onToggleSvgOverlap={() => setSvgOverlap((p) => !p)}
+        svgExportLayers={svgExportLayers}
+        onChangeSvgExportLayers={setSvgExportLayers}
         canUndo={histLen > 0}
         canRedo={redoLen > 0}
         onUndo={undo}
@@ -3515,7 +4855,13 @@ export default function App() {
         dark={dark}
         onToggleDark={() => setDark((d) => !d)}
         showHelp={showHelp}
-        onToggleHelp={() => setShowHelp((p) => !p)}
+        onToggleHelp={() => {
+          setShowHelp((p) => {
+            const nextVal = !p;
+            if (nextVal) setShowGridPanel(false);
+            return nextVal;
+          });
+        }}
       />
 
       <div className="relative flex-1 min-h-0 flex">
@@ -3534,26 +4880,28 @@ export default function App() {
           tanVariantIdx={tanVariantIdx}
           tanVariantCount={tanVariantCount}
           selectedIds={selectedIds}
+          selectedShapeIds={selectedShapeIds}
           prio={prio}
           edit={edit}
           hover={hover}
           ghost={ghost}
           marquee={marquee}
+          smartGuides={smartGuides}
           dimMode={dimMode}
           hasClipboard={hasClipboard}
-           refImgs={refImgs}
-           activeRefId={activeRefId}
-           onSelectRefImg={setActiveRefId}
-           onToggleRefLock={(id) =>
-             setRefImgs((prev) => prev.map((img) => (img.id === id ? { ...img, locked: !img.locked } : img)))
-           }
-           onRemoveRefImage={(id) => {
-             setRefImgs((prev) => prev.filter((img) => img.id !== id));
-             if (activeRefId === id) setActiveRefId(null);
-           }}
-           onChangeRefOpacity={(id, opacity) =>
-             setRefImgs((prev) => prev.map((img) => (img.id === id ? { ...img, opacity } : img)))
-           }
+          refImgs={refImgs}
+          activeRefId={activeRefId}
+          onSelectRefImg={setActiveRefId}
+          onToggleRefLock={(id) =>
+            setRefImgs((prev) => prev.map((img) => (img.id === id ? { ...img, locked: !img.locked } : img)))
+          }
+          onRemoveRefImage={(id) => {
+            setRefImgs((prev) => prev.filter((img) => img.id !== id));
+            if (activeRefId === id) setActiveRefId(null);
+          }}
+          onChangeRefOpacity={(id, opacity) =>
+            setRefImgs((prev) => prev.map((img) => (img.id === id ? { ...img, opacity } : img)))
+          }
           showRulers={showRulers}
           guides={guides}
           guidesVisible={guidesVisible}
@@ -3570,6 +4918,19 @@ export default function App() {
           editingDim={editingDim}
           dimDraft={dimDraft}
           dimError={dimError}
+          gridConfig={gridConfig}
+          showGridPanel={showGridPanel}
+          lineMode={lineMode}
+          onChangeLineMode={handleChangeLineMode}
+          circleMode={circleMode}
+          onChangeCircleMode={handleChangeCircleMode}
+          tgActive={tgOn}
+          shiftDown={shiftDown}
+          onToggleTg={handleToggleTg}
+          polySides={polySides}
+          creationOrigin={creationOrigin}
+          onChangeCreationOrigin={handleChangeCreationOrigin}
+          tanSnapEnabled={tanSnapEnabled}
           phases={phases}
           activePhaseId={activePhaseId}
           focusMode={focusMode}
@@ -3590,6 +4951,11 @@ export default function App() {
           }}
           onCommitDimEdit={handleCommitDimEdit}
           onCancelDimEdit={handleCancelDimEdit}
+          onChangeGridConfig={handleChangeGridConfig}
+          onCenterGridOrigin={handleCenterGridOrigin}
+          onGenerateFibGeometry={handleGenerateFibGeometry}
+          onCloseGridPanel={() => setShowGridPanel(false)}
+          onChangePolySides={setPolySides}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
@@ -3600,11 +4966,13 @@ export default function App() {
           onDeleteSelectedGuide={() => {
             if (guidesLockedRef.current || !selectedGuideIdRef.current) return;
             const id = selectedGuideIdRef.current;
+            pushHistory(objsRef.current);
             setGuides((prev) => prev.filter((g) => g.id !== id));
             setSelectedGuideId(null);
           }}
           onClearGuides={() => {
-            if (guidesLockedRef.current) return;
+            if (guidesLockedRef.current || guidesRef.current.length === 0) return;
+            pushHistory(objsRef.current);
             setGuides([]);
             setSelectedGuideId(null);
           }}
@@ -3613,6 +4981,9 @@ export default function App() {
           onDuplicateSelected={duplicateSelected}
           onDeleteSelected={deleteSelected}
           onClearSelection={() => setSelectedIds(new Set())}
+          onDeleteSelectedShapes={handleDeleteSelectedShapes}
+          onMoveSelectedShapesToPhase={handleMoveSelectedShapesToPhase}
+          onClearShapeSelection={() => setSelectedShapeIds(new Set())}
           onClearPrio={() => {
             setPrio(new Set());
             setPrioMode(false);
@@ -3652,13 +5023,23 @@ export default function App() {
           onRequestDeletePhase={handleRequestDeletePhase}
           onToggleFocusMode={() => setFocusMode((p) => !p)}
           onToggleCrossPhaseSnap={() => setCrossPhaseSnap((p) => !p)}
+          alignPopoverOpen={alignPopoverOpen}
+          onToggleAlignPopover={() => setAlignPopoverOpen((p) => !p)}
+          onAlignSelection={handleAlignSelection}
+          onDistributeSelection={handleDistributeSelection}
+          onGroupSelection={handleGroupSelection}
+          onUngroupSelection={handleUngroupSelection}
+          onCombineSelectedShapes={handleCombineSelectedShapes}
+          onMirrorSelection={handleMirrorSelection}
+          onRadialArraySelection={handleRadialArraySelection}
+          onToggleScaleLockSelection={handleToggleScaleLockSelection}
         />
 
         {/* Compact quick-reference popover */}
         {showHelp && (
           <aside
             aria-label="Atalhos e guia rápido"
-            className="absolute top-3 right-3 z-20 w-96 max-w-[calc(100vw-24px)] max-h-[calc(100%-24px)] overflow-y-auto rounded-lg border border-slate-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-lg p-4 text-xs text-slate-700 dark:text-zinc-300 space-y-2.5"
+            className="absolute top-3 right-3 z-20 w-96 max-w-[calc(100vw-24px)] max-h-[calc(100%-24px)] overflow-y-auto rounded-2xl border border-slate-200/80 dark:border-zinc-700/80 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-xl p-4 text-xs text-slate-700 dark:text-zinc-300 space-y-2.5"
           >
             <div className="flex items-center justify-between border-b border-slate-200 dark:border-zinc-800 pb-2">
               <h2 className="text-sm font-semibold text-slate-900 dark:text-zinc-100">
@@ -3668,57 +5049,45 @@ export default function App() {
                 type="button"
                 onClick={() => setShowHelp(false)}
                 aria-label="Fechar guia"
-                className="p-1 rounded hover:bg-slate-100 dark:hover:bg-zinc-800 text-slate-500 cursor-pointer"
+                className="p-1 rounded-full hover:bg-slate-100 dark:hover:bg-zinc-800 text-slate-500 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
             <div className="space-y-1.5 leading-relaxed">
               <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Construtor de Forma (F):</strong>{' '}
-                passe o cursor para destacar áreas fechadas e clique ou arraste para uni-las em um path na fase ativa. Fases posteriores nunca cortam formas anteriores — novas formas se sobrepõem e podem usar apenas a geometria das fases anteriores (<strong>+ Anteriores</strong> ou <strong>Só fase ativa</strong>). Use{' '}
-                <strong>Subtrair</strong> (ou <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Alt</kbd>) para remover partes.
+                <strong className="text-slate-900 dark:text-zinc-100">Seleção em caixa &amp; Mover (V):</strong>{' '}
+                clique e arraste no canvas vazio para selecionar vários objetos (segure <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Shift</kbd> para somar à seleção). Para mover a tela (pan), use <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Espaço</kbd>+arrastar ou botão do meio.
               </p>
               <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Fases e Linha do Tempo:</strong>{' '}
-                use a barra inferior para deslizar entre fases (ou <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">[</kbd> / <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">]</kbd>). Passe ou clique no círculo de uma fase para controlar visibilidade e opacidade de <strong>Geometria</strong> e <strong>Path</strong>, cor, trava 🔒 ou exclusão.
+                <strong className="text-slate-900 dark:text-zinc-100">Menu Freeform &amp; Simetria:</strong>{' '}
+                ao selecionar <span className="font-mono">1+</span> objetos, use a cápsula flutuante para <strong>Travar escala</strong>, <strong>Alinhar</strong>, <strong>Distribuir</strong>, <strong>Agrupar</strong>, <strong>Combinar Formas</strong>, <strong>Espelhar (H/V)</strong> e gerar <strong>Matriz radial (4×/6×/8×)</strong>.
+              </p>
+              <p>
+                <strong className="text-slate-900 dark:text-zinc-100">Reta (L / S / T) &amp; Círculo (C / B / A):</strong>{' '}
+                use a cápsula contextual para alternar os submodos de <strong>Reta</strong> (Livre, Tangente <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">S</kbd>, Tang. comum <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">T</kbd>) e <strong>Círculo</strong> (Centro, Sup. esq., Diâmetro <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">B</kbd>, Tangente <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">A</kbd>).
+              </p>
+              <p>
+                <strong className="text-slate-900 dark:text-zinc-100">Polígonos (Q) &amp; Grid (H):</strong>{' '}
+                desenhe a partir do <strong>Centro</strong> ou <strong>Sup. esq.</strong> e pressione <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">H</kbd> para <strong>Grid Fibonacci</strong>, <strong>Modular</strong>, <strong>Isométrico</strong>, <strong>Áureo (φ)</strong> ou <strong>Polar</strong>.
+              </p>
+              <p>
+                <strong className="text-slate-900 dark:text-zinc-100">Copiar e Colar ({modKey}+C / {modKey}+V):</strong>{' '}
+                copie círculos, polígonos e retas selecionados com <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">{modKey}+C</kbd>, cole com <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">{modKey}+V</kbd>, duplique com <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">{modKey}+D</kbd> ou apague com <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">{delKey}</kbd>.
+              </p>
+              <p>
+                <strong className="text-slate-900 dark:text-zinc-100">Construtor de Forma (F) &amp; Formas construídas:</strong>{' '}
+                clique ou arraste sobre regiões fechadas para criar um path na fase ativa (<kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">{optKey}</kbd> subtrai). Em <strong>Mover (V)</strong>, clique dentro de um path para selecioná-lo, movê-lo de fase ou excluí-lo.
               </p>
               <p>
                 <strong className="text-purple-700 dark:text-purple-400">
-                  Tangência possível (roxo):
+                  Tangência (roxo), Guias inteligentes (rosa) &amp; Snap (E / G):
                 </strong>{' '}
-                ao arrastar um objeto perto de outro, ou selecionar 2 objetos em ordem (
-                <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Shift</kbd>+clique),
-                pontos roxos mostram onde conectar tangencialmente. Toque no ponto roxo para unir o{' '}
-                <strong>1º ao 2º</strong>.
+                todos os objetos conversam com o snap de tangência (<kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">E</kbd>) e exibem guias inteligentes de alinhamento ao arrastar.
               </p>
               <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Editar círculos tangentes:</strong>{' '}
-                ao selecionar um círculo sem ponto azul na borda, surge uma <strong>alça temporária de
-                raio</strong> para redimensionar direto (ou arraste círculos 2× tangentes para deslizá-los).
-                Use <strong>Soltar tangência</strong> para reduzir restrições passo a passo.
-              </p>
-              <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Círculo tangente (A):</strong>{' '}
-                selecione de <strong>2 a 4</strong> círculos/retas/pontos para gerar o círculo tangente.
-                Com 2+, clique no canvas ou pressione{' '}
-                <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Enter</kbd> para criar;{' '}
-                <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Tab</kbd> alterna
-                variações.
-              </p>
-              <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Ajuste fino (Setas):</strong>{' '}
-                com um objeto ou guia selecionado, use as setas do teclado para mover <span className="font-mono">1px</span>{' '}
-                (<kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Alt</kbd> = <span className="font-mono">0,25px</span>,{' '}
-                <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Shift</kbd> = <span className="font-mono">10px</span>).
-              </p>
-              <p>
-                <strong className="text-slate-900 dark:text-zinc-100">Snap ({snapPx}px) e Réguas (U / R / K):</strong>{' '}
-                encaixa até <span className="font-mono tabular-nums">{snapPx}px</span> (<kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">Alt</kbd> ignora). Arraste das réguas para guias H/V ou use <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">U</kbd> para guias inclinadas e <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">K</kbd> para travar.
-              </p>
-              <p>
-                <strong className="text-slate-900 dark:text-zinc-100">SVG em camadas (+0,05px):</strong>{' '}
-                exporta <span className="font-mono">&lt;g id="fase-..."&gt;</span> separando paths e construção com sobreposição tangencial anti-gap.
+                <strong className="text-slate-900 dark:text-zinc-100">Réguas (U / R / K) &amp; Exportar SVG:</strong>{' '}
+                arraste das réguas para guias H/V, use <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">U</kbd> para guias inclinadas e <kbd className="font-mono px-1 bg-slate-100 dark:bg-zinc-800 rounded">K</kbd> para travar (com Desfazer/Refazer). No menu <strong>SVG</strong>, filtre entre <strong>Tudo</strong>, <strong>Só Paths</strong> ou <strong>Construção</strong>.
               </p>
             </div>
           </aside>
@@ -3831,6 +5200,8 @@ export default function App() {
           <span>
             Snap: {effectiveSnapActive ? `${snapPx}px` : altDown ? 'Pausado (Alt)' : 'Desligado'}
           </span>
+          <span aria-hidden="true">·</span>
+          <span>Snap tang.: {tanSnapEnabled ? 'Ativo' : 'Desligado'}</span>
           <span aria-hidden="true">·</span>
           <span>
             Guias: {guides.length}

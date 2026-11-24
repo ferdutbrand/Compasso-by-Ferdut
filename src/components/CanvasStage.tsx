@@ -10,6 +10,7 @@ import {
   Lock,
   Minus,
   Plus,
+  Square,
   Target,
   Trash2,
   Unlink,
@@ -19,29 +20,48 @@ import {
 import {
   clipLine,
   curve,
+  getAlignUnitCount,
   getObj,
+  getSelectionBoundingBox,
   guideToCurve,
   type CircleEditInfo,
 } from '../geometry/engine';
+import {
+  computeFibonacciTiles,
+  getSizeRuleOptions,
+  PHI,
+  type GridConfig,
+  type SizeRule,
+} from '../geometry/grid';
 import type { AtomicRegion } from '../geometry/shapeBuilder';
 import type {
+  AlignMode,
   BuiltShape,
+  CircleToolMode,
+  CombineShapeOp,
+  CreationOrigin,
   Curve,
   DimMode,
+  DistributeAxis,
   EditState,
   GeomObj,
   GhostPreview,
   GuideLine,
+  LineToolMode,
+  MirrorAxis,
   Phase,
   PointObj,
   RefImage,
+  SmartGuide,
   SnapResult,
   TanTargetSel,
   TangencyCandidate,
   ToolId,
   ViewState,
 } from '../geometry/types';
-import { modKey } from '../geometry/types';
+import { delKey, modKey, optKey } from '../geometry/types';
+import { FreeformAlignPopover } from './FreeformAlignPopover';
+import { GridPopover } from './GridPopover';
 import { PhaseTimeline, phaseDisplayColor, type PhaseCounts } from './PhaseTimeline';
 
 export interface MarqueeBox {
@@ -66,11 +86,13 @@ interface CanvasStageProps {
   tanVariantIdx: number;
   tanVariantCount: number;
   selectedIds: Set<number>;
+  selectedShapeIds: Set<string>;
   prio: Set<number>;
   edit: EditState | null;
   hover: SnapResult | null;
   ghost: GhostPreview | null;
   marquee: MarqueeBox | null;
+  smartGuides: SmartGuide[];
   dimMode: DimMode;
   hasClipboard: boolean;
   refImgs: RefImage[];
@@ -92,9 +114,22 @@ interface CanvasStageProps {
   altDown: boolean;
   isPanning: boolean;
   isDragging: boolean;
-  editingDim: { id: number; cx: number; cy: number; r: number } | null;
+  editingDim: { id: number; kind: 'ci' | 'pg'; cx: number; cy: number; val: number } | null;
   dimDraft: string;
   dimError: string | null;
+  gridConfig: GridConfig;
+  showGridPanel: boolean;
+  lineMode: LineToolMode;
+  onChangeLineMode: (mode: LineToolMode) => void;
+  circleMode: CircleToolMode;
+  onChangeCircleMode: (mode: CircleToolMode) => void;
+  tgActive: boolean;
+  shiftDown: boolean;
+  onToggleTg: () => void;
+  polySides: number;
+  creationOrigin: CreationOrigin;
+  onChangeCreationOrigin: (origin: CreationOrigin) => void;
+  tanSnapEnabled: boolean;
   phases: Phase[];
   activePhaseId: string;
   focusMode: boolean;
@@ -108,10 +143,15 @@ interface CanvasStageProps {
   dragShapeRegionIds: Set<string>;
   dragShapePreviewPath: string;
   lockNotice: string | null;
-  onOpenDimEditor: (circleId: number, cx: number, cy: number, r: number) => void;
+  onOpenDimEditor: (objId: number, kind: 'ci' | 'pg', cx: number, cy: number, val: number) => void;
   onChangeDimDraft: (v: string) => void;
-  onCommitDimEdit: () => void;
+  onCommitDimEdit: (overrideVal?: number) => void;
   onCancelDimEdit: () => void;
+  onChangeGridConfig: (patch: Partial<GridConfig>) => void;
+  onCenterGridOrigin: () => void;
+  onGenerateFibGeometry: (mode: 'squares' | 'circles' | 'both') => void;
+  onCloseGridPanel: () => void;
+  onChangePolySides: (sides: number) => void;
   onPointerDown: (e: React.PointerEvent<SVGSVGElement>) => void;
   onPointerMove: (e: React.PointerEvent<SVGSVGElement>) => void;
   onPointerUp: (e: React.PointerEvent<SVGSVGElement>) => void;
@@ -126,6 +166,9 @@ interface CanvasStageProps {
   onDuplicateSelected: () => void;
   onDeleteSelected: () => void;
   onClearSelection: () => void;
+  onDeleteSelectedShapes: () => void;
+  onMoveSelectedShapesToPhase: (phaseId: string) => void;
+  onClearShapeSelection: () => void;
   onClearPrio: () => void;
 
   onCancelEdit: () => void;
@@ -152,11 +195,32 @@ interface CanvasStageProps {
   onRequestDeletePhase: (id: string) => void;
   onToggleFocusMode: () => void;
   onToggleCrossPhaseSnap: () => void;
+  alignPopoverOpen: boolean;
+  onToggleAlignPopover: () => void;
+  onAlignSelection: (mode: AlignMode) => void;
+  onDistributeSelection: (axis: DistributeAxis) => void;
+  onGroupSelection: () => void;
+  onUngroupSelection: () => void;
+  onCombineSelectedShapes: (op: CombineShapeOp) => void;
+  onMirrorSelection: (axis: MirrorAxis) => void;
+  onRadialArraySelection: (count: number) => void;
+  onToggleScaleLockSelection: () => void;
 }
 
 type RenderedCurve =
-  | { id: number; phaseId: string; kind: 'c'; cx: number; cy: number; r: number }
-  | { id: number; phaseId: string; kind: 'l'; pts: [number, number, number, number] };
+  | { id: number; phaseId: string; kind: 'c'; cx: number; cy: number; r: number; scaleLocked?: boolean }
+  | { id: number; phaseId: string; kind: 'l'; pts: [number, number, number, number] }
+  | {
+      id: number;
+      phaseId: string;
+      kind: 'p';
+      points: string;
+      cx: number;
+      cy: number;
+      side: number;
+      sides: number;
+      scaleLocked?: boolean;
+    };
 
 function refPt(r: RefImage, lx: number, ly: number): [number, number] {
   const a = ((r.r || 0) * Math.PI) / 180;
@@ -327,6 +391,257 @@ const DraftingGuidesLayer = memo(function DraftingGuidesLayer({
   );
 });
 
+interface WorkGridLayerProps {
+  config: GridConfig;
+  dark: boolean;
+  viewK: number;
+  invK: number;
+  vpX0: number;
+  vpY0: number;
+  vpX1: number;
+  vpY1: number;
+}
+
+const WorkGridLayer = memo(function WorkGridLayer({
+  config,
+  dark,
+  viewK,
+  invK,
+  vpX0,
+  vpY0,
+  vpX1,
+  vpY1,
+}: WorkGridLayerProps) {
+  if (!config.enabled || config.kind === 'none') return null;
+
+  const majorStroke = dark ? '#3f3f46' : '#cbd5e1';
+  const minorStroke = dark ? '#27272a' : '#e2e8f0';
+  const fibStroke = dark ? '#10b981' : '#059669';
+  const originColor = dark ? '#34d399' : '#059669';
+  const u = Math.max(4, config.unit);
+
+  if (config.kind === 'fibonacci') {
+    const tiles = computeFibonacciTiles(config);
+    return (
+      <g style={{ pointerEvents: 'none' }}>
+        {tiles.map((t) => (
+          <g key={`fib-tile-${t.index}`}>
+            <rect
+              x={t.x}
+              y={t.y}
+              width={t.size}
+              height={t.size}
+              fill="none"
+              stroke={fibStroke}
+              strokeOpacity={0.28}
+              strokeWidth={1 * invK}
+            />
+            {config.fibShowCircles && (
+              <circle
+                cx={t.cx}
+                cy={t.cy}
+                r={t.size * 0.5}
+                fill="none"
+                stroke={fibStroke}
+                strokeOpacity={0.22}
+                strokeWidth={0.9 * invK}
+                strokeDasharray={`${3 * invK} ${3 * invK}`}
+              />
+            )}
+            {config.fibShowSpiral && (
+              <path
+                d={t.arcD}
+                fill="none"
+                stroke={fibStroke}
+                strokeOpacity={0.58}
+                strokeWidth={1.6 * invK}
+              />
+            )}
+            {config.fibShowLabels && t.size * viewK >= 22 && (
+              <text
+                x={t.cx}
+                y={t.cy + 4 * invK}
+                fontSize={10 * invK}
+                fontFamily="JetBrains Mono, monospace"
+                fontWeight="600"
+                textAnchor="middle"
+                fill={fibStroke}
+                opacity={0.45}
+              >
+                {t.label}
+              </text>
+            )}
+          </g>
+        ))}
+        <circle cx={config.originX} cy={config.originY} r={3 * invK} fill={originColor} opacity={0.55} />
+      </g>
+    );
+  }
+
+  if (config.kind === 'modular') {
+    const sub = Math.max(1, config.subdivisions);
+    const step = u / sub;
+    if (step * viewK < 6) {
+      // Fall back to major step only when zoomed far out
+      const startX = Math.floor((vpX0 - config.originX) / u) * u + config.originX;
+      const startY = Math.floor((vpY0 - config.originY) / u) * u + config.originY;
+      const vLines: number[] = [];
+      const hLines: number[] = [];
+      for (let x = startX; x <= vpX1 && vLines.length < 220; x += u) vLines.push(x);
+      for (let y = startY; y <= vpY1 && hLines.length < 220; y += u) hLines.push(y);
+      return (
+        <g style={{ pointerEvents: 'none' }}>
+          {vLines.map((x, idx) => (
+            <line key={`mv-${idx}`} x1={x} y1={vpY0} x2={x} y2={vpY1} stroke={majorStroke} strokeWidth={0.8 * invK} opacity={0.65} />
+          ))}
+          {hLines.map((y, idx) => (
+            <line key={`mh-${idx}`} x1={vpX0} y1={y} x2={vpX1} y2={y} stroke={majorStroke} strokeWidth={0.8 * invK} opacity={0.65} />
+          ))}
+        </g>
+      );
+    }
+    const minIx = Math.floor((vpX0 - config.originX) / step);
+    const maxIx = Math.ceil((vpX1 - config.originX) / step);
+    const minIy = Math.floor((vpY0 - config.originY) / step);
+    const maxIy = Math.ceil((vpY1 - config.originY) / step);
+    const xLines: Array<{ pos: number; major: boolean }> = [];
+    const yLines: Array<{ pos: number; major: boolean }> = [];
+    for (let ix = minIx; ix <= maxIx && xLines.length < 260; ix++) {
+      xLines.push({ pos: config.originX + ix * step, major: ((ix % sub) + sub) % sub === 0 });
+    }
+    for (let iy = minIy; iy <= maxIy && yLines.length < 260; iy++) {
+      yLines.push({ pos: config.originY + iy * step, major: ((iy % sub) + sub) % sub === 0 });
+    }
+    return (
+      <g style={{ pointerEvents: 'none' }}>
+        {xLines.map((l, idx) => (
+          <line
+            key={`gx-${idx}`}
+            x1={l.pos}
+            y1={vpY0}
+            x2={l.pos}
+            y2={vpY1}
+            stroke={l.major ? majorStroke : minorStroke}
+            strokeWidth={(l.major ? 1 : 0.7) * invK}
+            opacity={l.major ? 0.8 : 0.55}
+          />
+        ))}
+        {yLines.map((l, idx) => (
+          <line
+            key={`gy-${idx}`}
+            x1={vpX0}
+            y1={l.pos}
+            x2={vpX1}
+            y2={l.pos}
+            stroke={l.major ? majorStroke : minorStroke}
+            strokeWidth={(l.major ? 1 : 0.7) * invK}
+            opacity={l.major ? 0.8 : 0.55}
+          />
+        ))}
+        <circle cx={config.originX} cy={config.originY} r={3 * invK} fill={originColor} opacity={0.55} />
+      </g>
+    );
+  }
+
+  if (config.kind === 'isometric') {
+    const dy = (u * Math.sqrt(3)) / 2;
+    if (dy * viewK < 6) return null;
+    const minRow = Math.floor((vpY0 - config.originY) / dy) - 1;
+    const maxRow = Math.ceil((vpY1 - config.originY) / dy) + 1;
+    const hLines: number[] = [];
+    for (let r = minRow; r <= maxRow && hLines.length < 180; r++) {
+      hLines.push(config.originY + r * dy);
+    }
+    const slope = Math.sqrt(3);
+    const lines60: Array<[number, number, number, number]> = [];
+    const spanY = vpY1 - vpY0;
+    const dxSpan = spanY / slope;
+    const minK = Math.floor((vpX0 - dxSpan - config.originX) / u) - 1;
+    const maxK = Math.ceil((vpX1 + dxSpan - config.originX) / u) + 1;
+    for (let k = minK; k <= maxK && lines60.length < 320; k++) {
+      const bx = config.originX + k * u;
+      // +60°
+      const dyTop = vpY0 - config.originY;
+      const dyBot = vpY1 - config.originY;
+      lines60.push([bx + dyTop / slope, vpY0, bx + dyBot / slope, vpY1]);
+      // -60°
+      lines60.push([bx - dyTop / slope, vpY0, bx - dyBot / slope, vpY1]);
+    }
+    return (
+      <g style={{ pointerEvents: 'none' }}>
+        {hLines.map((y, idx) => (
+          <line key={`ih-${idx}`} x1={vpX0} y1={y} x2={vpX1} y2={y} stroke={minorStroke} strokeWidth={0.8 * invK} opacity={0.7} />
+        ))}
+        {lines60.map((pts, idx) => (
+          <line key={`ia-${idx}`} x1={pts[0]} y1={pts[1]} x2={pts[2]} y2={pts[3]} stroke={minorStroke} strokeWidth={0.8 * invK} opacity={0.65} />
+        ))}
+        <circle cx={config.originX} cy={config.originY} r={3 * invK} fill={originColor} opacity={0.55} />
+      </g>
+    );
+  }
+
+  if (config.kind === 'phi') {
+    const radii = [-4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6].map((k) => u * Math.pow(PHI, k));
+    return (
+      <g style={{ pointerEvents: 'none' }}>
+        <line x1={config.originX} y1={vpY0} x2={config.originX} y2={vpY1} stroke={fibStroke} strokeWidth={1.1 * invK} opacity={0.55} />
+        <line x1={vpX0} y1={config.originY} x2={vpX1} y2={config.originY} stroke={fibStroke} strokeWidth={1.1 * invK} opacity={0.55} />
+        {radii.map((r, idx) => (
+          <g key={`phi-${idx}`}>
+            <line x1={config.originX + r} y1={vpY0} x2={config.originX + r} y2={vpY1} stroke={fibStroke} strokeWidth={0.8 * invK} opacity={0.28} />
+            <line x1={config.originX - r} y1={vpY0} x2={config.originX - r} y2={vpY1} stroke={fibStroke} strokeWidth={0.8 * invK} opacity={0.28} />
+            <line x1={vpX0} y1={config.originY + r} x2={vpX1} y2={config.originY + r} stroke={fibStroke} strokeWidth={0.8 * invK} opacity={0.28} />
+            <line x1={vpX0} y1={config.originY - r} x2={vpX1} y2={config.originY - r} stroke={fibStroke} strokeWidth={0.8 * invK} opacity={0.28} />
+          </g>
+        ))}
+      </g>
+    );
+  }
+
+  if (config.kind === 'polar') {
+    const radii =
+      config.sizeRule === 'fibonacci'
+        ? [1, 2, 3, 5, 8, 13, 21, 34, 55].map((f) => f * u)
+        : Array.from({ length: 16 }, (_, idx) => (idx + 1) * u);
+    const maxR = radii[radii.length - 1] ?? u * 16;
+    const sectors = Math.max(4, config.subdivisions * 4);
+    return (
+      <g style={{ pointerEvents: 'none' }}>
+        {radii.map((r, idx) => (
+          <circle
+            key={`pr-${idx}`}
+            cx={config.originX}
+            cy={config.originY}
+            r={r}
+            fill="none"
+            stroke={config.sizeRule === 'fibonacci' ? fibStroke : majorStroke}
+            strokeWidth={0.85 * invK}
+            opacity={config.sizeRule === 'fibonacci' ? 0.36 : 0.6}
+          />
+        ))}
+        {Array.from({ length: sectors }, (_, i) => {
+          const a = (i * Math.PI * 2) / sectors;
+          return (
+            <line
+              key={`pa-${i}`}
+              x1={config.originX}
+              y1={config.originY}
+              x2={config.originX + maxR * Math.cos(a)}
+              y2={config.originY + maxR * Math.sin(a)}
+              stroke={minorStroke}
+              strokeWidth={0.8 * invK}
+              opacity={0.65}
+            />
+          );
+        })}
+        <circle cx={config.originX} cy={config.originY} r={3 * invK} fill={originColor} opacity={0.65} />
+      </g>
+    );
+  }
+
+  return null;
+});
+
 interface StaticGeometryLayerProps {
   objs: GeomObj[];
   curveCache: Array<Curve | null>;
@@ -347,7 +662,7 @@ interface StaticGeometryLayerProps {
   vpY0: number;
   vpX1: number;
   vpY1: number;
-  onOpenDimEditor: (circleId: number, cx: number, cy: number, r: number) => void;
+  onOpenDimEditor: (objId: number, kind: 'ci' | 'pg', cx: number, cy: number, val: number) => void;
 }
 
 const StaticGeometryLayer = memo(function StaticGeometryLayer({
@@ -423,6 +738,19 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
             />
           );
         }
+        if (c.t === 'p') {
+          return (
+            <polygon
+              key={`prio-${id}`}
+              points={c.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+              fill="none"
+              stroke="#f59e0b"
+              strokeWidth={4 * invK}
+              strokeLinejoin="round"
+              opacity={0.55}
+            />
+          );
+        }
         const pts = clipLine(c, vpX0, vpY0, vpX1, vpY1);
         if (!pts) return null;
         return (
@@ -442,18 +770,34 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
       {/* Selected curve halos */}
       {renderedCurves.map((item) => {
         if (!selectedIds.has(item.id)) return null;
-        return item.kind === 'c' ? (
-          <circle
-            key={`sel-c-${item.id}`}
-            cx={item.cx}
-            cy={item.cy}
-            r={item.r}
-            fill="none"
-            stroke="var(--ac)"
-            strokeWidth={5 * invK}
-            opacity={0.32}
-          />
-        ) : (
+        if (item.kind === 'c') {
+          return (
+            <circle
+              key={`sel-c-${item.id}`}
+              cx={item.cx}
+              cy={item.cy}
+              r={item.r}
+              fill="none"
+              stroke="var(--ac)"
+              strokeWidth={5 * invK}
+              opacity={0.32}
+            />
+          );
+        }
+        if (item.kind === 'p') {
+          return (
+            <polygon
+              key={`sel-p-${item.id}`}
+              points={item.points}
+              fill="none"
+              stroke="var(--ac)"
+              strokeWidth={5 * invK}
+              strokeLinejoin="round"
+              opacity={0.32}
+            />
+          );
+        }
+        return (
           <line
             key={`sel-l-${item.id}`}
             x1={item.pts[0]}
@@ -471,18 +815,34 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
       {renderedCurves.map((item) => {
         const st = styleForPhase(item.phaseId);
         if (st.opacity <= 0.01) return null;
-        return item.kind === 'c' ? (
-          <circle
-            key={item.id}
-            cx={item.cx}
-            cy={item.cy}
-            r={item.r}
-            fill="none"
-            stroke={st.color}
-            strokeOpacity={st.opacity}
-            strokeWidth={1.5 * invK}
-          />
-        ) : (
+        if (item.kind === 'c') {
+          return (
+            <circle
+              key={item.id}
+              cx={item.cx}
+              cy={item.cy}
+              r={item.r}
+              fill="none"
+              stroke={st.color}
+              strokeOpacity={st.opacity}
+              strokeWidth={1.5 * invK}
+            />
+          );
+        }
+        if (item.kind === 'p') {
+          return (
+            <polygon
+              key={item.id}
+              points={item.points}
+              fill="none"
+              stroke={st.color}
+              strokeOpacity={st.opacity}
+              strokeWidth={1.5 * invK}
+              strokeLinejoin="round"
+            />
+          );
+        }
+        return (
           <line
             key={item.id}
             x1={item.pts[0]}
@@ -496,12 +856,13 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
         );
       })}
 
-      {/* Low-opacity circle dimension labels at center (clickable in Mover mode to edit) */}
+      {/* Low-opacity circle & polygon dimension labels at center (clickable in Mover mode to edit) */}
       {dimMode !== 'off' &&
         renderedCurves.map((item) => {
+          if (item.kind !== 'c' && item.kind !== 'p') return null;
+          const sizeMetric = item.kind === 'c' ? item.r : item.side * 0.5;
           if (
-            item.kind !== 'c' ||
-            item.r * viewK < 14 ||
+            sizeMetric * viewK < 14 ||
             item.cx < vpX0 ||
             item.cx > vpX1 ||
             item.cy < vpY0 ||
@@ -511,7 +872,13 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
           }
           const st = styleForPhase(item.phaseId);
           if (st.opacity <= 0.01) return null;
-          const label = dimMode === 'd' ? formatDim(item.r * 2, 'Ø') : formatDim(item.r, 'r');
+          const labelBase =
+            item.kind === 'c'
+              ? dimMode === 'd'
+                ? formatDim(item.r * 2, 'Ø')
+                : formatDim(item.r, 'r')
+              : formatDim(item.side, 'L');
+          const label = item.scaleLocked ? `🔒 ${labelBase}` : labelBase;
           const canClick = tool === 'move';
           return (
             <text
@@ -527,15 +894,23 @@ const StaticGeometryLayer = memo(function StaticGeometryLayer({
               className={canClick ? 'hover:opacity-90 transition-opacity' : ''}
               style={{
                 pointerEvents: canClick ? 'auto' : 'none',
-                cursor: canClick ? 'text' : 'default',
+                cursor: canClick ? (item.scaleLocked ? 'not-allowed' : 'text') : 'default',
               }}
               onPointerDown={(e) => {
                 if (!canClick || e.button !== 0) return;
                 e.stopPropagation();
-                onOpenDimEditor(item.id, item.cx, item.cy, item.r);
+                if (item.kind === 'c') {
+                  onOpenDimEditor(item.id, 'ci', item.cx, item.cy, item.r);
+                } else {
+                  onOpenDimEditor(item.id, 'pg', item.cx, item.cy, item.side);
+                }
               }}
             >
-              <title>Clique para editar a dimensão respeitando as tangentes</title>
+              <title>
+                {item.scaleLocked
+                  ? 'Escala travada — desbloqueie na barra para alterar a dimensão'
+                  : 'Clique para editar a dimensão'}
+              </title>
               {label}
             </text>
           );
@@ -592,11 +967,13 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   tanVariantIdx,
   tanVariantCount,
   selectedIds,
+  selectedShapeIds,
   prio,
   edit,
   hover,
   ghost,
   marquee,
+  smartGuides,
   dimMode,
   hasClipboard,
   refImgs,
@@ -621,6 +998,19 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   editingDim,
   dimDraft,
   dimError,
+  gridConfig,
+  showGridPanel,
+  lineMode,
+  onChangeLineMode,
+  circleMode,
+  onChangeCircleMode,
+  tgActive,
+  shiftDown,
+  onToggleTg,
+  polySides,
+  creationOrigin,
+  onChangeCreationOrigin,
+  tanSnapEnabled: _tanSnapEnabled,
   phases,
   activePhaseId,
   focusMode,
@@ -638,6 +1028,11 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   onChangeDimDraft,
   onCommitDimEdit,
   onCancelDimEdit,
+  onChangeGridConfig,
+  onCenterGridOrigin,
+  onGenerateFibGeometry,
+  onCloseGridPanel,
+  onChangePolySides,
   onPointerDown,
   onPointerMove,
   onPointerUp,
@@ -652,6 +1047,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   onDuplicateSelected,
   onDeleteSelected,
   onClearSelection,
+  onDeleteSelectedShapes,
+  onMoveSelectedShapesToPhase,
+  onClearShapeSelection,
   onClearPrio,
 
   onCancelEdit,
@@ -678,6 +1076,16 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   onRequestDeletePhase,
   onToggleFocusMode,
   onToggleCrossPhaseSnap,
+  alignPopoverOpen,
+  onToggleAlignPopover,
+  onAlignSelection,
+  onDistributeSelection,
+  onGroupSelection,
+  onUngroupSelection,
+  onCombineSelectedShapes,
+  onMirrorSelection,
+  onRadialArraySelection,
+  onToggleScaleLockSelection,
 }) => {
   const vbW = Math.max(1, size.w) / view.k;
   const vbH = Math.max(1, size.h) / view.k;
@@ -711,7 +1119,30 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
         if (c.x + c.r < vpX0 || c.x - c.r > vpX1 || c.y + c.r < vpY0 || c.y - c.r > vpY1) {
           continue;
         }
-        items.push({ id: o.id, phaseId: pid, kind: 'c', cx: c.x, cy: c.y, r: c.r });
+        items.push({
+          id: o.id,
+          phaseId: pid,
+          kind: 'c',
+          cx: c.x,
+          cy: c.y,
+          r: c.r,
+          scaleLocked: o.t === 'ci' ? !!o.scaleLocked : undefined,
+        });
+      } else if (c.t === 'p') {
+        if (c.cx + c.r < vpX0 || c.cx - c.r > vpX1 || c.cy + c.r < vpY0 || c.cy - c.r > vpY1) {
+          continue;
+        }
+        items.push({
+          id: o.id,
+          phaseId: pid,
+          kind: 'p',
+          points: c.verts.map((v) => `${v.x},${v.y}`).join(' '),
+          cx: c.cx,
+          cy: c.cy,
+          side: c.side,
+          sides: c.sides,
+          scaleLocked: o.t === 'pg' ? !!o.scaleLocked : undefined,
+        });
       } else {
         const pts = clipLine(c, vpX0, vpY0, vpX1, vpY1);
         if (pts) {
@@ -740,7 +1171,17 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     if (!o || o.dead || o.t !== 'ci') return null;
     const cv = curve(objs, o, curveCache);
     if (!cv || cv.t !== 'c') return null;
-    return { id: o.id, cx: cv.x, cy: cv.y, r: cv.r };
+    return { id: o.id, cx: cv.x, cy: cv.y, r: cv.r, scaleLocked: !!o.scaleLocked };
+  }, [curveCache, objs, selectedIds]);
+
+  const selectedPolyInfo = useMemo(() => {
+    if (selectedIds.size !== 1) return null;
+    const onlyId = Array.from(selectedIds)[0];
+    const o = getObj(objs, onlyId);
+    if (!o || o.dead || o.t !== 'pg') return null;
+    const cv = curve(objs, o, curveCache);
+    if (!cv || cv.t !== 'p') return null;
+    return { id: o.id, cx: cv.cx, cy: cv.cy, side: cv.side, sides: cv.sides, scaleLocked: !!o.scaleLocked };
   }, [curveCache, objs, selectedIds]);
 
   const selectedCount = useMemo(() => {
@@ -751,6 +1192,45 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     }
     return n;
   }, [objs, selectedIds]);
+
+  const selectionLayoutMeta = useMemo(() => {
+    let scalableCount = 0;
+    let lockedScalableCount = 0;
+    let closedCurveCount = 0;
+    let canUngroup = false;
+    for (const id of selectedIds) {
+      const o = getObj(objs, id);
+      if (!o || o.dead) continue;
+      if (o.groupId) canUngroup = true;
+      if (o.t === 'ci' || o.t === 'pg') {
+        scalableCount++;
+        if (o.scaleLocked) lockedScalableCount++;
+        if (curve(objs, o, curveCache)) closedCurveCount++;
+      }
+    }
+    const unitCount = selectedIds.size > 0 ? getAlignUnitCount(objs, selectedIds, curveCache) : 0;
+    const scaleLockState: 'none' | 'partial' | 'all' =
+      lockedScalableCount === 0
+        ? 'none'
+        : lockedScalableCount === scalableCount
+          ? 'all'
+          : 'partial';
+    return {
+      unitCount,
+      canGroup: unitCount >= 2,
+      canUngroup,
+      closedCurveCount,
+      hasScalableSelection: scalableCount > 0,
+      scaleLockState,
+    };
+  }, [curveCache, objs, selectedIds]);
+
+  const selectionBounds = useMemo(() => {
+    if (tool !== 'move' || edit || selectedIds.size === 0) return null;
+    return getSelectionBoundingBox(objs, selectedIds, curveCache);
+  }, [curveCache, edit, objs, selectedIds, tool]);
+  const showGroupBoundingBox =
+    !!selectionBounds && (selectionLayoutMeta.unitCount >= 2 || selectionLayoutMeta.canUngroup);
 
   const activeImg = useMemo(() => {
     return refImgs.find((img) => img.id === activeRefId) ?? refImgs[refImgs.length - 1] ?? null;
@@ -834,7 +1314,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
     let curves = 0;
     for (const id of selectedIds) {
       const o = getObj(objs, id);
-      if (o && !o.dead && (o.t === 'ci' || o.t === 'ln')) curves++;
+      if (o && !o.dead && (o.t === 'ci' || o.t === 'ln' || o.t === 'pg')) curves++;
     }
     return curves;
   }, [objs, selectedIds]);
@@ -862,7 +1342,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
         tone: 'purple' as const,
       };
     }
-    if (tool === 'tcir' && hoveredTanTarget !== null && tanSel.length < 4 && cursorWorld) {
+    if (tool === 'ci' && circleMode === 'tangent' && hoveredTanTarget !== null && tanSel.length < 4 && cursorWorld) {
       const n = tanSel.length + 1;
       return {
         x: cursorWorld.x,
@@ -888,20 +1368,24 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
       }
     }
     return null;
-  }, [cursorWorld, dragTanOverlay, ghost, hover, hoveredSelTanCand, hoveredTanTarget, tanSel.length, tool]);
+  }, [circleMode, cursorWorld, dragTanOverlay, ghost, hover, hoveredSelTanCand, hoveredTanTarget, tanSel.length, tool]);
 
   const invK = 1 / view.k;
+  const tgOn = tgActive || shiftDown;
   const showContextBar =
     selectedCount > 0 ||
+    selectedShapeIds.size > 0 ||
     hasClipboard ||
     prio.size > 0 ||
     refImgs.length > 0 ||
     edit !== null ||
     guides.length > 0 ||
     tool === 'shape' ||
+    tool === 'ln' ||
+    tool === 'ci' ||
+    tool === 'pg' ||
     Boolean(lockNotice) ||
-    Boolean(activePhase?.locked && tool !== 'move') ||
-    (tool === 'tcir' && tanSel.length > 0);
+    Boolean(activePhase?.locked && tool !== 'move');
 
   const rulerMeasure = useMemo(() => {
     if (tool !== 'ruler' || !rulerStart || !hover) return null;
@@ -974,11 +1458,11 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
         )}
 
         <div className="relative flex-1 min-w-0 min-h-0 overflow-hidden">
-          {/* Contextual floating action strip */}
+          {/* Unified Freeform-inspired floating contextual capsules */}
           {showContextBar && (
-            <div className="absolute top-3 left-3 z-10 flex flex-wrap items-center gap-2 pointer-events-none">
+            <div className="absolute top-3 left-3 right-3 z-10 flex flex-wrap items-center gap-2 pointer-events-none">
               {edit && (
-                <div className="pointer-events-auto inline-flex items-center gap-2 px-3 py-1.5 rounded-md border border-rose-300 dark:border-rose-800 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs text-slate-800 dark:text-zinc-100">
+                <div className="pointer-events-auto inline-flex items-center gap-2 px-3 py-1 rounded-full border border-rose-300/90 dark:border-rose-800 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs text-slate-800 dark:text-zinc-100">
                   <span className="font-medium text-rose-600 dark:text-rose-400">Editando círculo</span>
                   <span className="text-slate-500 dark:text-zinc-400">
                     Clique para definir diâmetro ou Shift para tangente
@@ -986,7 +1470,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                   <button
                     type="button"
                     onClick={onCancelEdit}
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 cursor-pointer"
                   >
                     <X className="w-3 h-3" />
                     <span>Esc</span>
@@ -994,18 +1478,18 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                 </div>
               )}
 
-              {(selectedCount > 0 || hasClipboard) && !edit && (
-                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-200 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
+              {(selectedCount > 0 || selectedShapeIds.size > 0 || hasClipboard) && !edit && (
+                <div className="pointer-events-auto inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
                   {selectedCount > 0 && (
                     <>
-                      <span className="font-mono tabular-nums text-slate-700 dark:text-zinc-200 pr-1">
+                      <span className="font-mono tabular-nums text-slate-700 dark:text-zinc-200 pl-1 pr-0.5">
                         {selectedCount} selecionado{selectedCount > 1 ? 's' : ''}
                       </span>
                       <button
                         type="button"
                         onClick={onCopySelected}
                         title={`Copiar seleção (${modKey}+C)`}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 font-medium cursor-pointer"
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 font-medium cursor-pointer"
                       >
                         <Copy className="w-3 h-3" />
                         <span>Copiar</span>
@@ -1014,7 +1498,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                         type="button"
                         onClick={onDuplicateSelected}
                         title={`Duplicar seleção (${modKey}+D)`}
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600 text-white hover:bg-blue-700 font-medium cursor-pointer"
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-blue-600 text-white hover:bg-blue-700 font-medium cursor-pointer"
                       >
                         <Clipboard className="w-3 h-3" />
                         <span>Duplicar</span>
@@ -1022,8 +1506,8 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       <button
                         type="button"
                         onClick={onDeleteSelected}
-                        title="Excluir seleção (Delete)"
-                        className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-600 text-white hover:bg-rose-700 font-medium cursor-pointer"
+                        title={`Excluir seleção (${delKey})`}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-rose-600 text-white hover:bg-rose-700 font-medium cursor-pointer"
                       >
                         <Trash2 className="w-3 h-3" />
                         <span>Excluir</span>
@@ -1034,19 +1518,59 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                           onClick={() =>
                             onOpenDimEditor(
                               selectedCircleInfo.id,
+                              'ci',
                               selectedCircleInfo.cx,
                               selectedCircleInfo.cy,
                               selectedCircleInfo.r
                             )
                           }
-                          title="Editar dimensão do círculo mantendo tangências conectadas"
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50 font-mono tabular-nums cursor-pointer"
+                          title={
+                            selectedCircleInfo.scaleLocked
+                              ? 'Escala travada — desbloqueie na cápsula flutuante para alterar a medida'
+                              : 'Editar dimensão do círculo mantendo tangências conectadas'
+                          }
+                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-full border font-mono tabular-nums cursor-pointer ${
+                            selectedCircleInfo.scaleLocked
+                              ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+                              : 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50'
+                          }`}
                         >
+                          {selectedCircleInfo.scaleLocked && <Lock className="w-3 h-3" />}
                           <span>
-                            Editar{' '}
+                            {selectedCircleInfo.scaleLocked ? '' : 'Editar '}
                             {dimMode === 'r'
                               ? formatDim(selectedCircleInfo.r, 'r')
                               : formatDim(selectedCircleInfo.r * 2, 'Ø')}
+                          </span>
+                        </button>
+                      )}
+                      {selectedPolyInfo && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenDimEditor(
+                              selectedPolyInfo.id,
+                              'pg',
+                              selectedPolyInfo.cx,
+                              selectedPolyInfo.cy,
+                              selectedPolyInfo.side
+                            )
+                          }
+                          title={
+                            selectedPolyInfo.scaleLocked
+                              ? 'Escala travada — desbloqueie na cápsula flutuante para alterar o lado'
+                              : 'Editar comprimento do lado'
+                          }
+                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-full border font-mono tabular-nums cursor-pointer ${
+                            selectedPolyInfo.scaleLocked
+                              ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+                              : 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50'
+                          }`}
+                        >
+                          {selectedPolyInfo.scaleLocked && <Lock className="w-3 h-3" />}
+                          <span>
+                            {selectedPolyInfo.scaleLocked ? '' : 'Editar '}
+                            {formatDim(selectedPolyInfo.side, 'L')}
                           </span>
                         </button>
                       )}
@@ -1058,7 +1582,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                           onChange={(e) => {
                             if (e.target.value) onMoveSelectedToPhase(e.target.value);
                           }}
-                          className="px-2 py-1 rounded border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 font-medium cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600"
+                          className="px-2 py-1 rounded-full border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 font-medium cursor-pointer focus-visible:outline-2 focus-visible:outline-blue-600"
                         >
                           <option value="" disabled>
                             Mover p/ fase...
@@ -1075,7 +1599,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                           type="button"
                           onClick={onStartTanFromSelection}
                           title="Construir círculo tangente aos objetos selecionados"
-                          className="inline-flex items-center gap-1 px-2 py-1 rounded border border-cyan-300 dark:border-cyan-700 bg-cyan-50 dark:bg-cyan-950/40 text-cyan-800 dark:text-cyan-200 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 font-medium cursor-pointer"
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded-full border border-cyan-300 dark:border-cyan-700 bg-cyan-50 dark:bg-cyan-950/40 text-cyan-800 dark:text-cyan-200 hover:bg-cyan-100 dark:hover:bg-cyan-900/50 font-medium cursor-pointer"
                         >
                           <Target className="w-3 h-3" />
                           <span>Círculo tangente</span>
@@ -1083,7 +1607,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       )}
                       {selectedConstraintInfo && selectedConstraintInfo.constraintCount > 0 && (
                         <>
-                          <span className="font-mono tabular-nums text-[11px] px-1.5 py-0.5 rounded bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800">
+                          <span className="font-mono tabular-nums text-[11px] px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800">
                             {selectedConstraintInfo.isLocked
                               ? `${selectedConstraintInfo.constraintCount}× travado`
                               : selectedEditInfo?.canSlideTan2
@@ -1094,7 +1618,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                             type="button"
                             onClick={() => onReleaseTangency('one')}
                             title="Remover uma restrição de tangência para editar livremente"
-                            className="inline-flex items-center gap-1 px-2 py-1 rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/60 font-medium cursor-pointer"
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded-full border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-900/60 font-medium cursor-pointer"
                           >
                             <Unlink className="w-3 h-3" />
                             <span>Soltar tangência</span>
@@ -1104,7 +1628,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                               type="button"
                               onClick={() => onReleaseTangency('all')}
                               title="Soltar todas as tangências deste objeto"
-                              className="px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 font-medium cursor-pointer"
+                              className="px-2 py-1 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 font-medium cursor-pointer"
                             >
                               Liberar tudo
                             </button>
@@ -1113,12 +1637,59 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       )}
                     </>
                   )}
+
+                  {selectedCount === 0 && selectedShapeIds.size > 0 && (
+                    <>
+                      <span className="font-mono tabular-nums text-slate-700 dark:text-zinc-200 pl-1 pr-0.5">
+                        {selectedShapeIds.size} forma{selectedShapeIds.size > 1 ? 's' : ''}
+                      </span>
+                      {phases.length > 1 && (
+                        <select
+                          aria-label="Mover formas selecionadas para fase"
+                          title="Mover formas selecionadas para outra fase"
+                          value=""
+                          onChange={(e) => {
+                            if (e.target.value) onMoveSelectedShapesToPhase(e.target.value);
+                          }}
+                          className="px-2 py-1 rounded-full border border-slate-200 dark:border-zinc-700 bg-slate-50 dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 font-medium cursor-pointer"
+                        >
+                          <option value="" disabled>
+                            Mover p/ fase...
+                          </option>
+                          {phases.map((ph, idx) => (
+                            <option key={ph.id} value={ph.id}>
+                              {idx + 1}. {ph.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <button
+                        type="button"
+                        onClick={onDeleteSelectedShapes}
+                        title={`Excluir forma(s) selecionada(s) (${delKey})`}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-rose-600 text-white hover:bg-rose-700 font-medium cursor-pointer"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        <span>Excluir</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={onClearShapeSelection}
+                        title="Limpar seleção de formas (Esc)"
+                        aria-label="Limpar seleção de formas"
+                        className="p-1 rounded-full text-slate-500 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </>
+                  )}
+
                   {hasClipboard && (
                     <button
                       type="button"
                       onClick={onPasteClipboard}
                       title={`Colar elementos copiados (${modKey}+V)`}
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 font-medium cursor-pointer"
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-full bg-slate-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 font-medium cursor-pointer"
                     >
                       <ClipboardPaste className="w-3 h-3" />
                       <span>Colar</span>
@@ -1130,7 +1701,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       onClick={onClearSelection}
                       title="Limpar seleção (Esc)"
                       aria-label="Limpar seleção"
-                      className="p-1 rounded text-slate-500 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
+                      className="p-1 rounded-full text-slate-500 hover:bg-slate-100 dark:hover:bg-zinc-800 cursor-pointer"
                     >
                       <X className="w-3 h-3" />
                     </button>
@@ -1138,32 +1709,326 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                 </div>
               )}
 
+              {/* Unified Line (L) Freeform Inspector Capsule */}
+              {tool === 'ln' && !edit && (
+                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
+                  <span className="font-semibold text-slate-800 dark:text-zinc-100 pl-1 whitespace-nowrap">
+                    Reta
+                  </span>
+                  <div
+                    role="group"
+                    aria-label="Modo da ferramenta Reta"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                  >
+                    {(
+                      [
+                        { id: 'free', label: 'Livre', title: 'Reta livre entre 2 pontos (L)' },
+                        { id: 'tangent', label: 'Tangente (S)', title: 'Reta tangente a círculo ou vértice (S)' },
+                        { id: 'common', label: 'Tang. comum (T)', title: 'Tangente comum entre 2 círculos (T)' },
+                      ] as Array<{ id: LineToolMode; label: string; title: string }>
+                    ).map((opt) => {
+                      const active = opt.id === 'tangent' ? lineMode === 'tangent' || (lineMode === 'free' && tgOn) : lineMode === opt.id;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => onChangeLineMode(opt.id)}
+                          aria-pressed={active}
+                          title={opt.title}
+                          className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                            active
+                              ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                              : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Unified Circle (C) Freeform Inspector Capsule */}
+              {tool === 'ci' && !edit && (
+                <div className="pointer-events-auto inline-flex flex-wrap items-center gap-2 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
+                  <span className="font-semibold text-slate-800 dark:text-zinc-100 pl-1 whitespace-nowrap">
+                    Círculo
+                  </span>
+                  <div
+                    role="group"
+                    aria-label="Modo de criação de círculo"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                  >
+                    {(
+                      [
+                        { id: 'center', label: 'Centro', title: 'Centro + raio (C)' },
+                        { id: 'top-left', label: 'Sup. esq.', title: 'Canto superior esquerdo + caixa' },
+                        { id: 'diameter', label: 'Borda (B)', title: 'Diâmetro por 2 pontos da borda (B)' },
+                        { id: 'tangent', label: 'Tang. 2–4 (A)', title: 'Círculo tangente a 2–4 objetos (A)' },
+                      ] as Array<{ id: CircleToolMode; label: string; title: string }>
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => onChangeCircleMode(opt.id)}
+                        aria-pressed={circleMode === opt.id}
+                        title={opt.title}
+                        className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                          circleMode === opt.id
+                            ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                            : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {(circleMode === 'center' || circleMode === 'diameter') && (
+                    <button
+                      type="button"
+                      onClick={onToggleTg}
+                      aria-pressed={tgOn}
+                      title="Modo Tangente (S ou segure Shift)"
+                      className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                        tgOn
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-slate-200/75 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700'
+                      }`}
+                    >
+                      Tang. (S)
+                    </button>
+                  )}
+
+                  {circleMode !== 'tangent' ? (
+                    <>
+                      <div
+                        role="group"
+                        aria-label="Regra de tamanho"
+                        className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                      >
+                        {(
+                          [
+                            { id: 'free', label: 'Livre' },
+                            { id: 'fibonacci', label: 'Fib' },
+                            { id: 'golden', label: 'φ' },
+                            { id: 'modular', label: 'Mod' },
+                          ] as Array<{ id: SizeRule; label: string }>
+                        ).map((r) => (
+                          <button
+                            key={r.id}
+                            type="button"
+                            onClick={() => onChangeGridConfig({ sizeRule: r.id })}
+                            aria-pressed={gridConfig.sizeRule === r.id}
+                            title={`Regra de tamanho ${r.label} (${optKey} libera temporariamente)`}
+                            className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                              gridConfig.sizeRule === r.id
+                                ? 'bg-emerald-600 text-white shadow-sm'
+                                : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                            }`}
+                          >
+                            {r.label}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => onChangeGridConfig({ lockScale: !gridConfig.lockScale })}
+                        aria-pressed={gridConfig.lockScale}
+                        title="Travar escala dos novos círculos ao criar"
+                        className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                          gridConfig.lockScale
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-slate-200/75 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700'
+                        }`}
+                      >
+                        {gridConfig.lockScale ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                        <span>Travar novos</span>
+                      </button>
+                    </>
+                  ) : (
+                    <div className="inline-flex items-center gap-1.5 pl-1 border-l border-slate-200 dark:border-zinc-700">
+                      <span className="font-mono tabular-nums font-medium text-blue-700 dark:text-blue-300">
+                        {tanSel.length}/4
+                      </span>
+                      {tanSel.length < 2 && (
+                        <span className="text-slate-500 dark:text-zinc-400">
+                          {tanSel.length === 0 ? 'Clique nos alvos' : '2º alvo'}
+                        </span>
+                      )}
+                      {tanSel.length >= 2 && ghost && (
+                        <button
+                          type="button"
+                          onClick={onCreateTanCircle}
+                          title="Criar círculo tangente agora (Enter)"
+                          className="px-2.5 py-0.5 rounded-full bg-blue-600 text-white hover:bg-blue-700 font-medium cursor-pointer"
+                        >
+                          Criar (Enter)
+                        </button>
+                      )}
+                      {tanSel.length >= 2 && tanVariantCount > 1 && (
+                        <button
+                          type="button"
+                          onClick={onCycleTanVariant}
+                          title="Alternar variação de tangência (Tab)"
+                          className="px-2 py-0.5 rounded-full bg-slate-200/80 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 font-mono tabular-nums cursor-pointer"
+                        >
+                          {(tanVariantIdx % tanVariantCount) + 1}/{tanVariantCount} (Tab)
+                        </button>
+                      )}
+                      {tanSel.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={onClearTanSel}
+                          title="Limpar alvos (Esc)"
+                          className="px-2 py-0.5 rounded-full bg-slate-200/80 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300 cursor-pointer"
+                        >
+                          Limpar
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Unified Polygon (Q) Freeform Inspector Capsule */}
+              {tool === 'pg' && !edit && (
+                <div className="pointer-events-auto inline-flex flex-wrap items-center gap-2 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
+                  <Square className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 shrink-0 ml-0.5" />
+                  <div
+                    role="group"
+                    aria-label="Forma do polígono"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                  >
+                    {[
+                      { s: 4, label: 'Quad', full: 'Quadrado' },
+                      { s: 3, label: 'Tri', full: 'Triângulo' },
+                      { s: 5, label: 'Pent', full: 'Pentágono' },
+                      { s: 6, label: 'Hex', full: 'Hexágono' },
+                      { s: 8, label: 'Oct', full: 'Octógono' },
+                    ].map((opt) => (
+                      <button
+                        key={opt.s}
+                        type="button"
+                        onClick={() => onChangePolySides(opt.s)}
+                        aria-pressed={polySides === opt.s}
+                        title={opt.full}
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                          polySides === opt.s
+                            ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                            : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div
+                    role="group"
+                    aria-label="Origem da criação"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onChangeCreationOrigin('center')}
+                      aria-pressed={creationOrigin === 'center'}
+                      title="Primeiro clique define o centro"
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                        creationOrigin === 'center'
+                          ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                          : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      Centro
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onChangeCreationOrigin('top-left')}
+                      aria-pressed={creationOrigin === 'top-left'}
+                      title="Primeiro clique ancora o canto superior esquerdo"
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                        creationOrigin === 'top-left'
+                          ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                          : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      Sup. esq.
+                    </button>
+                  </div>
+
+                  <div
+                    role="group"
+                    aria-label="Regra de tamanho"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
+                  >
+                    {(
+                      [
+                        { id: 'free', label: 'Livre' },
+                        { id: 'fibonacci', label: 'Fib' },
+                        { id: 'golden', label: 'φ' },
+                        { id: 'modular', label: 'Mod' },
+                      ] as Array<{ id: SizeRule; label: string }>
+                    ).map((r) => (
+                      <button
+                        key={r.id}
+                        type="button"
+                        onClick={() => onChangeGridConfig({ sizeRule: r.id })}
+                        aria-pressed={gridConfig.sizeRule === r.id}
+                        title={`Regra de tamanho ${r.label} (${optKey} libera temporariamente)`}
+                        className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                          gridConfig.sizeRule === r.id
+                            ? 'bg-emerald-600 text-white shadow-sm'
+                            : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
+                        }`}
+                      >
+                        {r.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onChangeGridConfig({ lockScale: !gridConfig.lockScale })}
+                    aria-pressed={gridConfig.lockScale}
+                    title="Travar escala dos novos polígonos ao criar"
+                    className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap transition cursor-pointer ${
+                      gridConfig.lockScale
+                        ? 'bg-amber-600 text-white'
+                        : 'bg-slate-200/75 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700'
+                    }`}
+                  >
+                    {gridConfig.lockScale ? <Lock className="w-3 h-3" /> : <Unlock className="w-3 h-3" />}
+                    <span>Travar novos</span>
+                  </button>
+                </div>
+              )}
+
+              {/* Unified Shape Builder (F) Freeform Capsule */}
               {tool === 'shape' && !edit && (
-                <div className="pointer-events-auto inline-flex flex-wrap items-center gap-1.5 px-2.5 py-1 rounded-md border border-slate-200 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
+                <div className="pointer-events-auto inline-flex flex-wrap items-center gap-2 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
                   <span
-                    className="w-2.5 h-2.5 rounded-full shrink-0 border border-black/15 dark:border-white/20"
+                    className="w-2.5 h-2.5 rounded-full shrink-0 border border-black/15 dark:border-white/20 ml-0.5"
                     style={{ backgroundColor: activeDispColor }}
                     aria-hidden="true"
                   />
                   <Combine className="w-3.5 h-3.5 text-slate-600 dark:text-zinc-300 shrink-0" />
-                  <span className="font-semibold text-slate-800 dark:text-zinc-100 whitespace-nowrap">
-                    Construtor
-                  </span>
 
                   <div
                     role="group"
                     aria-label="Operação do construtor de forma"
-                    className="inline-flex rounded border border-slate-200 dark:border-zinc-700 overflow-hidden"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
                   >
                     <button
                       type="button"
                       onClick={() => onChangeShapeMode('add')}
                       aria-pressed={effectiveShapeMode === 'add'}
                       title="Unir regiões fechadas em um path (clique ou arraste)"
-                      className={`inline-flex items-center gap-1 px-2 py-1 font-medium whitespace-nowrap cursor-pointer ${
+                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap cursor-pointer ${
                         effectiveShapeMode === 'add'
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                          ? 'bg-blue-600 text-white shadow-sm'
+                          : 'text-slate-700 dark:text-zinc-200 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
                       <Plus className="w-3 h-3" />
@@ -1174,31 +2039,31 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       onClick={() => onChangeShapeMode('sub')}
                       aria-pressed={effectiveShapeMode === 'sub'}
                       title="Subtrair regiões de um path existente (ou segure Alt)"
-                      className={`inline-flex items-center gap-1 px-2 py-1 font-medium whitespace-nowrap border-l border-slate-200 dark:border-zinc-700 cursor-pointer ${
+                      className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap cursor-pointer ${
                         effectiveShapeMode === 'sub'
-                          ? 'bg-rose-600 text-white'
-                          : 'bg-white dark:bg-zinc-950 text-slate-700 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                          ? 'bg-rose-600 text-white shadow-sm'
+                          : 'text-slate-700 dark:text-zinc-200 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
                       <Minus className="w-3 h-3" />
-                      <span>Subtrair (Alt)</span>
+                      <span>Subtrair ({optKey})</span>
                     </button>
                   </div>
 
                   <div
                     role="group"
                     aria-label="Origem das curvas para regiões"
-                    className="inline-flex rounded border border-slate-200 dark:border-zinc-700 overflow-hidden"
+                    className="inline-flex rounded-full bg-slate-200/75 dark:bg-zinc-800/80 p-0.5 gap-0.5"
                   >
                     <button
                       type="button"
                       onClick={() => onChangeShapeScope('all')}
                       aria-pressed={shapeScope === 'all'}
                       title="Usa geometria visível desta fase e das anteriores sem interferir nas formas já criadas"
-                      className={`px-2 py-1 font-medium whitespace-nowrap cursor-pointer ${
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap cursor-pointer ${
                         shapeScope === 'all'
-                          ? 'bg-slate-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
-                          : 'bg-white dark:bg-zinc-950 text-slate-600 dark:text-zinc-300 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                          ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                          : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
                       + Anteriores
@@ -1208,10 +2073,10 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       onClick={() => onChangeShapeScope('phase')}
                       aria-pressed={shapeScope === 'phase'}
                       title="Usa somente a geometria da fase ativa"
-                      className={`px-2 py-1 font-medium whitespace-nowrap border-l border-slate-200 dark:border-zinc-700 cursor-pointer ${
+                      className={`px-2 py-0.5 rounded-full text-[11px] font-medium whitespace-nowrap cursor-pointer ${
                         shapeScope === 'phase'
-                          ? 'bg-slate-900 dark:bg-zinc-100 text-white dark:text-zinc-900'
-                          : 'bg-white dark:bg-zinc-950 text-slate-600 dark:text-zinc-300 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                          ? 'bg-white dark:bg-zinc-700 text-slate-900 dark:text-zinc-100 shadow-sm'
+                          : 'text-slate-600 dark:text-zinc-300 hover:text-slate-900 dark:hover:text-white'
                       }`}
                     >
                       Só fase ativa
@@ -1227,7 +2092,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       type="button"
                       onClick={onClearPhaseShapes}
                       title="Remover formas construídas nesta fase"
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 font-medium whitespace-nowrap cursor-pointer"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 font-medium whitespace-nowrap cursor-pointer"
                     >
                       <Trash2 className="w-3 h-3" />
                       <span>Limpar formas</span>
@@ -1237,7 +2102,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               )}
 
               {(lockNotice || (activePhase?.locked && tool !== 'move')) && (
-                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-md border border-amber-300 dark:border-amber-700 bg-amber-50/95 dark:bg-amber-950/90 shadow-sm text-xs text-amber-900 dark:text-amber-200">
+                <div className="pointer-events-auto inline-flex items-center gap-2 px-3 py-1 rounded-full border border-amber-300/90 dark:border-amber-700 bg-amber-50/95 dark:bg-amber-950/90 backdrop-blur-md shadow-lg text-xs text-amber-900 dark:text-amber-200">
                   <Lock className="w-3.5 h-3.5 shrink-0" />
                   <span className="font-medium">
                     {lockNotice ?? `Fase "${activePhase?.name}" bloqueada`}
@@ -1246,7 +2111,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     <button
                       type="button"
                       onClick={onUnlockActivePhase}
-                      className="px-2 py-0.5 rounded bg-amber-600 text-white hover:bg-amber-700 font-medium whitespace-nowrap cursor-pointer"
+                      className="px-2 py-0.5 rounded-full bg-amber-600 text-white hover:bg-amber-700 font-medium whitespace-nowrap cursor-pointer"
                     >
                       Destravar
                     </button>
@@ -1255,19 +2120,19 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               )}
 
               {tool === 'move' && selTanCandidates.length > 0 && !edit && (
-                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-purple-300 dark:border-purple-700 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
+                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-full border border-purple-300/90 dark:border-purple-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
                   <span className="inline-block w-2 h-2 rounded-full bg-purple-600 dark:bg-purple-400" />
                   <span className="font-medium text-purple-700 dark:text-purple-300">
                     Tangência possível (1º → 2º):
                   </span>
                   <span className="text-slate-600 dark:text-zinc-300">
-                    toque em um ponto roxo para conectar
+                    toque em um ponto roxo
                   </span>
                   <button
                     type="button"
                     onClick={onSwapSelectionOrder}
                     title="Inverter ordem de seleção (2º conecta ao 1º)"
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-purple-50 dark:bg-purple-950/50 text-purple-700 dark:text-purple-200 border border-purple-200 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-purple-900/60 font-medium cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-purple-50 dark:bg-purple-950/50 text-purple-700 dark:text-purple-200 border border-purple-200 dark:border-purple-800 hover:bg-purple-100 dark:hover:bg-purple-900/60 font-medium cursor-pointer"
                   >
                     <ArrowLeftRight className="w-3 h-3" />
                     <span>Inverter (1º ↔ 2º)</span>
@@ -1275,60 +2140,16 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                 </div>
               )}
 
-              {tool === 'tcir' && tanSel.length > 0 && (
-                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-blue-200 dark:border-blue-800 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
-                  <Target className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                  <span className="font-mono tabular-nums font-medium text-blue-700 dark:text-blue-300">
-                    Tangentes: {tanSel.length}/4
-                  </span>
-                  {tanSel.length < 4 && (
-                    <span className="text-slate-500 dark:text-zinc-400">
-                      {tanSel.length === 1
-                        ? 'Clique no 2º círculo/objeto'
-                        : 'Clique p/ criar ou adicione até 4'}
-                    </span>
-                  )}
-                  {tanSel.length >= 2 && ghost && (
-                    <button
-                      type="button"
-                      onClick={onCreateTanCircle}
-                      title="Criar círculo tangente agora (Enter ou clique no canvas)"
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-blue-600 text-white hover:bg-blue-700 font-medium cursor-pointer"
-                    >
-                      <span>Criar círculo (Enter)</span>
-                    </button>
-                  )}
-                  {tanSel.length >= 2 && tanVariantCount > 1 && (
-                    <button
-                      type="button"
-                      onClick={onCycleTanVariant}
-                      title="Alternar variação de tangência (Tab)"
-                      className="px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 font-mono tabular-nums cursor-pointer"
-                    >
-                      Variação {(tanVariantIdx % tanVariantCount) + 1}/{tanVariantCount} (Tab)
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={onClearTanSel}
-                    title="Limpar seleção de tangentes (Esc)"
-                    className="px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
-                  >
-                    Limpar (Esc)
-                  </button>
-                </div>
-              )}
-
               {guides.length > 0 && (
-                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-cyan-200 dark:border-cyan-800 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
-                  <span className="font-mono tabular-nums text-cyan-700 dark:text-cyan-300 font-medium">
+                <div className="pointer-events-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-cyan-200/90 dark:border-cyan-800 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
+                  <span className="font-mono tabular-nums text-cyan-700 dark:text-cyan-300 font-medium pl-1">
                     Guias: {guides.length}
                   </span>
                   <button
                     type="button"
                     onClick={onToggleGuidesVisible}
                     title={guidesVisible ? 'Ocultar guias' : 'Mostrar guias'}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700 cursor-pointer"
                   >
                     {guidesVisible ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
                     <span>{guidesVisible ? 'Visíveis' : 'Ocultas'}</span>
@@ -1337,7 +2158,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     type="button"
                     onClick={onToggleGuidesLocked}
                     title="Bloquear/Desbloquear guias (K)"
-                    className={`inline-flex items-center gap-1 px-2 py-1 rounded font-medium cursor-pointer ${
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium cursor-pointer ${
                       guidesLocked
                         ? 'bg-amber-600 text-white'
                         : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-zinc-200 hover:bg-slate-200 dark:hover:bg-zinc-700'
@@ -1351,7 +2172,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       type="button"
                       onClick={onDeleteSelectedGuide}
                       title="Excluir guia selecionada (Delete)"
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-rose-600 text-white hover:bg-rose-700 font-medium cursor-pointer"
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-600 text-white hover:bg-rose-700 font-medium cursor-pointer"
                     >
                       <Trash2 className="w-3 h-3" />
                       <span>Remover guia</span>
@@ -1362,7 +2183,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       type="button"
                       onClick={onClearGuides}
                       title="Remover todas as guias"
-                      className="px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 cursor-pointer"
+                      className="px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 cursor-pointer"
                     >
                       Limpar
                     </button>
@@ -1371,14 +2192,14 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               )}
 
               {prio.size > 0 && (
-                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-md border border-amber-300 dark:border-amber-700 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs">
-                  <span className="font-mono tabular-nums font-medium text-amber-700 dark:text-amber-400">
+                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-full border border-amber-300/90 dark:border-amber-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs">
+                  <span className="font-mono tabular-nums font-medium text-amber-700 dark:text-amber-400 pl-1">
                     Prioridade: {prio.size} objeto{prio.size > 1 ? 's' : ''}
                   </span>
                   <button
                     type="button"
                     onClick={onClearPrio}
-                    className="px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-900/70 font-medium cursor-pointer"
+                    className="px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-900 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-900/70 font-medium cursor-pointer"
                   >
                     Limpar (Esc)
                   </button>
@@ -1386,9 +2207,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               )}
 
               {activeImg && (
-                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-md border border-slate-200 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 shadow-sm text-xs text-slate-700 dark:text-zinc-200">
+                <div className="pointer-events-auto inline-flex items-center gap-2 px-2.5 py-1 rounded-full border border-slate-200/90 dark:border-zinc-700 bg-white/95 dark:bg-zinc-900/95 backdrop-blur-md shadow-lg text-xs text-slate-700 dark:text-zinc-200">
                   {refImgs.length > 1 && (
-                    <div className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-500 dark:text-zinc-400 pr-1 border-r border-slate-200 dark:border-zinc-700">
+                    <div className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-500 dark:text-zinc-400 pl-1 pr-1.5 border-r border-slate-200 dark:border-zinc-700">
                       <span>Img {refImgs.findIndex((i) => i.id === activeImg.id) + 1}/{refImgs.length}</span>
                       <button
                         type="button"
@@ -1398,7 +2219,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                           if (next) onSelectRefImg(next.id);
                         }}
                         title="Alternar para próxima imagem de referência"
-                        className="px-1 rounded bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-750 cursor-pointer"
+                        className="px-1 rounded-full bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-750 cursor-pointer"
                       >
                         ⇄
                       </button>
@@ -1408,7 +2229,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     type="button"
                     onClick={() => onToggleRefLock(activeImg.id)}
                     title={activeImg.locked ? 'Imagem bloqueada (clique para desbloquear)' : 'Bloquear imagem de referência'}
-                    className={`inline-flex items-center gap-1 px-2 py-1 rounded font-medium cursor-pointer ${
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-medium cursor-pointer ${
                       activeImg.locked
                         ? 'bg-blue-600 text-white'
                         : 'bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700'
@@ -1436,7 +2257,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     type="button"
                     onClick={() => onRemoveRefImage(activeImg.id)}
                     title="Remover esta imagem de referência"
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded bg-slate-100 dark:bg-zinc-800 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 cursor-pointer"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 dark:bg-zinc-800 hover:bg-rose-100 hover:text-rose-700 dark:hover:bg-rose-950/50 dark:hover:text-rose-300 cursor-pointer"
                   >
                     <X className="w-3 h-3" />
                     <span>Remover</span>
@@ -1473,6 +2294,18 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               />
             ))}
 
+            {/* Modular / Fibonacci / Golden / Polar Work Grid Layer */}
+            <WorkGridLayer
+              config={gridConfig}
+              dark={dark}
+              viewK={view.k}
+              invK={invK}
+              vpX0={vpX0}
+              vpY0={vpY0}
+              vpX1={vpX1}
+              vpY1={vpY1}
+            />
+
             {/* Memoized drafting guides layer */}
             <DraftingGuidesLayer
               guides={guides}
@@ -1501,9 +2334,18 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                   fillRule="evenodd"
                   style={{ pointerEvents: 'none' }}
                 >
-                  {phaseShapes.map((sh) => (
-                    <path key={sh.id} d={sh.d} />
-                  ))}
+                  {phaseShapes.map((sh) => {
+                    const isSel = selectedShapeIds.has(sh.id);
+                    return (
+                      <path
+                        key={sh.id}
+                        d={sh.d}
+                        stroke={isSel ? '#2563eb' : undefined}
+                        strokeWidth={isSel ? 2.2 * invK : undefined}
+                        strokeDasharray={isSel ? `${5 * invK} ${3 * invK}` : undefined}
+                      />
+                    );
+                  })}
                 </g>
               );
             })}
@@ -1601,6 +2443,20 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                   />
                 );
               }
+              if (c.t === 'p') {
+                return (
+                  <polygon
+                    key={`tcsel-p-${id}`}
+                    points={c.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                    fill="none"
+                    stroke="var(--ac)"
+                    strokeWidth={4 * invK}
+                    strokeLinejoin="round"
+                    opacity={0.38}
+                  />
+                );
+              }
+              if (c.t !== 'l') return null;
               const pts = clipLine(c, vpX0, vpY0, vpX1, vpY1);
               if (!pts) return null;
               return (
@@ -1617,8 +2473,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               );
             })}
 
-            {/* Hovered candidate target in tcir mode */}
-            {tool === 'tcir' &&
+            {/* Hovered candidate target in multi-tangent circle mode */}
+            {tool === 'ci' &&
+              circleMode === 'tangent' &&
               hoveredTanTarget !== null &&
               tanSel.length < 4 &&
               (() => {
@@ -1652,6 +2509,19 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     />
                   );
                 }
+                if (c.t === 'p') {
+                  return (
+                    <polygon
+                      points={c.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                      fill="none"
+                      stroke="#0891b2"
+                      strokeWidth={4 * invK}
+                      strokeLinejoin="round"
+                      opacity={0.45}
+                    />
+                  );
+                }
+                if (c.t !== 'l') return null;
                 const pts = clipLine(c, vpX0, vpY0, vpX1, vpY1);
                 if (!pts) return null;
                 return (
@@ -1716,6 +2586,20 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     />
                   );
                 }
+                if (c.t === 'p') {
+                  return (
+                    <polygon
+                      key={`gtan-${gid}-${idx}`}
+                      points={c.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                      fill="none"
+                      stroke="var(--ac)"
+                      strokeWidth={4 * invK}
+                      strokeLinejoin="round"
+                      opacity={0.35}
+                    />
+                  );
+                }
+                if (c.t !== 'l') return null;
                 const pts = clipLine(c, vpX0, vpY0, vpX1, vpY1);
                 if (!pts) return null;
                 return (
@@ -1733,7 +2617,11 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               })}
 
             {/* Ghost preview + Shift tangency guidelines */}
-            {ghost && (pend.length === 1 || tool === 'tc' || tool === 'tcir' || edit !== null) && (
+            {ghost &&
+              (pend.length === 1 ||
+                (tool === 'ln' && lineMode === 'common') ||
+                (tool === 'ci' && circleMode === 'tangent') ||
+                edit !== null) && (
               <>
                 {ghost.guidelines?.map((gl, idx) => (
                   <line
@@ -1749,7 +2637,58 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                   />
                 ))}
 
-                {ghost.ln ? (
+                {ghost.box && (
+                  <g style={{ pointerEvents: 'none' }}>
+                    <rect
+                      x={ghost.box.x}
+                      y={ghost.box.y}
+                      width={ghost.box.w}
+                      height={ghost.box.h}
+                      fill="none"
+                      stroke="#0891b2"
+                      strokeWidth={1 * invK}
+                      strokeDasharray={`${3.5 * invK} ${3 * invK}`}
+                      opacity={0.75}
+                    />
+                    <rect
+                      x={ghost.box.x - 3 * invK}
+                      y={ghost.box.y - 3 * invK}
+                      width={6 * invK}
+                      height={6 * invK}
+                      fill="#0891b2"
+                      stroke="#fff"
+                      strokeWidth={1 * invK}
+                    />
+                  </g>
+                )}
+
+                {ghost.pg ? (
+                  <>
+                    <polygon
+                      points={ghost.pg.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                      fill="none"
+                      stroke="var(--ac)"
+                      strokeWidth={1.5 * invK}
+                      strokeDasharray={`${5 * invK} ${4 * invK}`}
+                      strokeLinejoin="round"
+                    />
+                    {dimMode !== 'off' && ghost.pg.side * view.k >= 18 && (
+                      <text
+                        x={ghost.pg.cx}
+                        y={ghost.pg.cy + 12 * invK}
+                        fontSize={10.5 * invK}
+                        fontFamily="JetBrains Mono, monospace"
+                        fontWeight="500"
+                        textAnchor="middle"
+                        fill="var(--ac)"
+                        opacity={0.65}
+                        style={{ pointerEvents: 'none' }}
+                      >
+                        {formatDim(ghost.pg.side, 'L')}
+                      </text>
+                    )}
+                  </>
+                ) : ghost.ln ? (
                   (() => {
                     const pts = clipLine(ghost.ln, vpX0, vpY0, vpX1, vpY1);
                     if (!pts) return null;
@@ -1843,6 +2782,20 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                         />
                       );
                     }
+                    if (tc.t === 'p') {
+                      return (
+                        <polygon
+                          key={`tcand-t-${tid}`}
+                          points={tc.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                          fill="none"
+                          stroke="var(--tcand)"
+                          strokeWidth={4 * invK}
+                          strokeLinejoin="round"
+                          opacity={0.32}
+                        />
+                      );
+                    }
+                    if (tc.t !== 'l') return null;
                     const pts = clipLine(tc, vpX0, vpY0, vpX1, vpY1);
                     if (!pts) return null;
                     return (
@@ -1884,7 +2837,16 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                           strokeWidth={2 * invK}
                           strokeDasharray={`${5 * invK} ${3.5 * invK}`}
                         />
-                      ) : (
+                      ) : activeCand.previewCurve.t === 'p' ? (
+                        <polygon
+                          points={activeCand.previewCurve.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                          fill="none"
+                          stroke="var(--tcand)"
+                          strokeWidth={2 * invK}
+                          strokeDasharray={`${5 * invK} ${3.5 * invK}`}
+                          strokeLinejoin="round"
+                        />
+                      ) : activeCand.previewCurve.t === 'l' ? (
                         (() => {
                           const pts = clipLine(activeCand.previewCurve, vpX0, vpY0, vpX1, vpY1);
                           if (!pts) return null;
@@ -1900,7 +2862,7 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                             />
                           );
                         })()
-                      )}
+                      ) : null}
                     </>
                   )}
 
@@ -1913,6 +2875,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                     if (oc.t === 'c') {
                       bx = oc.x;
                       by = oc.y - oc.r - 12 * invK;
+                    } else if (oc.t === 'p') {
+                      bx = oc.cx;
+                      by = oc.cy - oc.r - 12 * invK;
                     } else {
                       const pts = clipLine(oc, vpX0, vpY0, vpX1, vpY1);
                       if (!pts) return null;
@@ -2027,6 +2992,21 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       />
                     );
                   }
+                  if (pc.t === 'p') {
+                    return (
+                      <polygon
+                        key={`parent-p-${pid}`}
+                        points={pc.verts.map((v) => `${v.x},${v.y}`).join(' ')}
+                        fill="none"
+                        stroke="#d97706"
+                        strokeWidth={2.5 * invK}
+                        strokeDasharray={`${6 * invK} ${4 * invK}`}
+                        strokeLinejoin="round"
+                        opacity={0.58}
+                      />
+                    );
+                  }
+                  if (pc.t !== 'l') return null;
                   const pts = clipLine(pc, vpX0, vpY0, vpX1, vpY1);
                   if (!pts) return null;
                   return (
@@ -2139,6 +3119,25 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               );
             })}
 
+            {/* Smart alignment snap guides during drag */}
+            {isDragging && smartGuides.length > 0 && (
+              <g style={{ pointerEvents: 'none' }}>
+                {smartGuides.map((sg, idx) => (
+                  <line
+                    key={`sg-${idx}`}
+                    x1={sg.x1}
+                    y1={sg.y1}
+                    x2={sg.x2}
+                    y2={sg.y2}
+                    stroke="#ec4899"
+                    strokeWidth={1.15 * invK}
+                    strokeDasharray={`${3.5 * invK} ${3 * invK}`}
+                    opacity={0.88}
+                  />
+                ))}
+              </g>
+            )}
+
             {/* Marquee selection box */}
             {marquee && (
               <rect
@@ -2152,6 +3151,38 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                 strokeWidth={1 * invK}
                 strokeDasharray={`${4 * invK} ${3 * invK}`}
               />
+            )}
+
+            {/* Freeform-style Selection Bounding Box (when 2+ units or group selected) */}
+            {showGroupBoundingBox && selectionBounds && !isDragging && (
+              <g style={{ pointerEvents: 'none' }}>
+                <rect
+                  x={selectionBounds.minX}
+                  y={selectionBounds.minY}
+                  width={Math.max(1e-3, selectionBounds.width)}
+                  height={Math.max(1e-3, selectionBounds.height)}
+                  fill="none"
+                  stroke="#2563eb"
+                  strokeWidth={1.15 * invK}
+                  opacity={0.85}
+                />
+                {[
+                  [selectionBounds.minX, selectionBounds.minY],
+                  [selectionBounds.maxX, selectionBounds.minY],
+                  [selectionBounds.maxX, selectionBounds.maxY],
+                  [selectionBounds.minX, selectionBounds.maxY],
+                ].map(([cx, cy], idx) => (
+                  <circle
+                    key={`sel-bbox-dot-${idx}`}
+                    cx={cx}
+                    cy={cy}
+                    r={3.8 * invK}
+                    fill="#38bdf8"
+                    stroke="#ffffff"
+                    strokeWidth={1.1 * invK}
+                  />
+                ))}
+              </g>
             )}
 
             {/* Reference image transform handles */}
@@ -2188,6 +3219,31 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               </g>
             )}
           </svg>
+
+          {/* Freeform-style Floating Selection Capsule + Align/Distribute/Group/Combine/Symmetry Popover */}
+          {selectionBounds && !isDragging && !editingDim && (
+            <FreeformAlignPopover
+              open={alignPopoverOpen}
+              onToggleOpen={onToggleAlignPopover}
+              anchorScreenX={(selectionBounds.cx - view.x) * view.k}
+              anchorScreenY={(selectionBounds.minY - view.y) * view.k}
+              containerW={size.w}
+              unitCount={selectionLayoutMeta.unitCount}
+              canGroup={selectionLayoutMeta.canGroup}
+              canUngroup={selectionLayoutMeta.canUngroup}
+              closedCurveCount={selectionLayoutMeta.closedCurveCount}
+              hasScalableSelection={selectionLayoutMeta.hasScalableSelection}
+              scaleLockState={selectionLayoutMeta.scaleLockState}
+              onAlign={onAlignSelection}
+              onDistribute={onDistributeSelection}
+              onGroup={onGroupSelection}
+              onUngroup={onUngroupSelection}
+              onCombineShapes={onCombineSelectedShapes}
+              onMirror={onMirrorSelection}
+              onRadialArray={onRadialArraySelection}
+              onToggleScaleLock={onToggleScaleLockSelection}
+            />
+          )}
 
           {/* GPU-composited cursor / snap reticle & label overlay (avoids SVG dirty-rect paint trails) */}
           {hover && (
@@ -2249,14 +3305,18 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
             </div>
           )}
 
-          {/* Inline dimension editor overlay at circle center */}
+          {/* Inline dimension editor overlay at circle/polygon center */}
           {editingDim &&
             (() => {
               const sx = (editingDim.cx - view.x) * view.k;
               const sy = (editingDim.cy - view.y) * view.k;
-              const left = Math.min(Math.max(12, sx - 84), Math.max(12, size.w - 184));
-              const top = Math.min(Math.max(12, sy - 20), Math.max(12, size.h - 96));
-              const unitPrefix = dimMode === 'r' ? 'r' : 'Ø';
+              const left = Math.min(Math.max(12, sx - 96), Math.max(12, size.w - 220));
+              const top = Math.min(Math.max(12, sy - 20), Math.max(12, size.h - 140));
+              const unitPrefix = editingDim.kind === 'pg' ? 'L' : dimMode === 'r' ? 'r' : 'Ø';
+              const rulePresets =
+                gridConfig.sizeRule !== 'free'
+                  ? getSizeRuleOptions(gridConfig.sizeRule, gridConfig.unit, gridConfig.subdivisions).slice(0, 6)
+                  : [];
               return (
                 <form
                   onSubmit={(e) => {
@@ -2265,10 +3325,16 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                   }}
                   onPointerDown={(e) => e.stopPropagation()}
                   style={{ left, top }}
-                  className="absolute z-20 w-44 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-zinc-900 shadow-lg p-2 space-y-1.5 text-xs"
+                  className="absolute z-20 w-52 rounded-md border border-blue-300 dark:border-blue-700 bg-white dark:bg-zinc-900 shadow-lg p-2 space-y-1.5 text-xs"
                 >
                   <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-zinc-400">
-                    <span>{dimMode === 'r' ? 'Raio (r)' : 'Diâmetro (Ø)'} · tangentes fixas</span>
+                    <span>
+                      {editingDim.kind === 'pg'
+                        ? 'Lado (L)'
+                        : dimMode === 'r'
+                          ? 'Raio (r) · tangentes fixas'
+                          : 'Diâmetro (Ø) · tangentes fixas'}
+                    </span>
                     <button
                       type="button"
                       onClick={onCancelDimEdit}
@@ -2304,6 +3370,21 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                       OK
                     </button>
                   </div>
+                  {rulePresets.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-0.5">
+                      {rulePresets.map((opt) => (
+                        <button
+                          key={opt.tag}
+                          type="button"
+                          onClick={() => onCommitDimEdit(opt.value)}
+                          title={`Aplicar ${opt.tag} (${opt.value} px)`}
+                          className="px-1.5 py-0.5 rounded border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 font-mono text-[10px] cursor-pointer"
+                        >
+                          {opt.tag}: {opt.value}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   {dimError && (
                     <p className="text-[11px] leading-snug text-rose-600 dark:text-rose-400">
                       {dimError}
@@ -2312,6 +3393,16 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
                 </form>
               );
             })()}
+
+          {showGridPanel && (
+            <GridPopover
+              config={gridConfig}
+              onChange={onChangeGridConfig}
+              onCenterOrigin={onCenterGridOrigin}
+              onGenerateFibGeometry={onGenerateFibGeometry}
+              onClose={onCloseGridPanel}
+            />
+          )}
 
           {/* Floating Bottom Phase Timeline Dock */}
           <PhaseTimeline

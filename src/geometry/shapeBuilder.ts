@@ -1,5 +1,5 @@
-import { inter, projectOnCurve } from './engine';
-import type { BuiltShape, CircleCurve, Curve, LineCurve } from './types';
+import { inter, polyEdges, projectOnCurve } from './engine';
+import type { BuiltShape, CircleCurve, CombineShapeOp, Curve, LineCurve, PolyCurve } from './types';
 
 const V_MERGE_EPS = 1e-3;
 const PARAM_DEDUP_EPS = 1e-4;
@@ -327,18 +327,34 @@ export function buildPlanarArrangement(curves: Curve[]): PlanarArrangement {
 
   const circles: CircleCurve[] = [];
   const lines: LineCurve[] = [];
+  const segments: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
   for (const cv of curves) {
     if (cv.t === 'c' && Number.isFinite(cv.r) && cv.r > 1e-3) circles.push(cv);
     else if (cv.t === 'l' && Math.hypot(cv.dx, cv.dy) > 1e-9) lines.push(cv);
+    else if (cv.t === 'p' && cv.verts.length >= 3) {
+      for (const e of polyEdges(cv)) {
+        if (Math.hypot(e.x2 - e.x1, e.y2 - e.y1) > 1e-4) segments.push(e);
+      }
+    }
   }
 
   // Track exact vertex IDs belonging to each curve
   const circleVerts: number[][] = circles.map(() => []);
   const lineVerts: number[][] = lines.map(() => []);
+  const segVerts: number[][] = segments.map(() => []);
 
   const addCurveVert = (arr: number[], vid: number) => {
     if (!arr.includes(vid)) arr.push(vid);
   };
+
+  // Seed polygon segment endpoints as vertices
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const v1 = getOrAddVertex(s.x1, s.y1);
+    const v2 = getOrAddVertex(s.x2, s.y2);
+    addCurveVert(segVerts[i], v1.id);
+    addCurveVert(segVerts[i], v2.id);
+  }
 
   // Circle x Circle
   for (let i = 0; i < circles.length; i++) {
@@ -380,6 +396,75 @@ export function buildPlanarArrangement(curves: Curve[]): PlanarArrangement {
     }
   }
 
+  // Segment x Circle
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const dx = s.x2 - s.x1;
+    const dy = s.y2 - s.y1;
+    const a = dx * dx + dy * dy;
+    if (a < 1e-12) continue;
+    for (let j = 0; j < circles.length; j++) {
+      const c = circles[j];
+      const fx = s.x1 - c.x;
+      const fy = s.y1 - c.y;
+      const b = 2 * (fx * dx + fy * dy);
+      const cc = fx * fx + fy * fy - c.r * c.r;
+      const D = b * b - 4 * a * cc;
+      if (D < -1e-9 * a) continue;
+      const sq = Math.sqrt(Math.max(0, D));
+      for (const sg of sq < 1e-9 ? [1] : [-1, 1]) {
+        const t = (-b + sg * sq) / (2 * a);
+        if (t >= -1e-6 && t <= 1 + 1e-6) {
+          const tc = Math.min(1, Math.max(0, t));
+          const v = getOrAddVertex(s.x1 + tc * dx, s.y1 + tc * dy);
+          addCurveVert(segVerts[i], v.id);
+          addCurveVert(circleVerts[j], v.id);
+        }
+      }
+    }
+  }
+
+  // Segment x Line
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const dx = s.x2 - s.x1;
+    const dy = s.y2 - s.y1;
+    for (let j = 0; j < lines.length; j++) {
+      const l = lines[j];
+      const d = dx * l.dy - dy * l.dx;
+      if (Math.abs(d) < 1e-12) continue;
+      const t = ((l.x - s.x1) * l.dy - (l.y - s.y1) * l.dx) / d;
+      if (t >= -1e-6 && t <= 1 + 1e-6) {
+        const tc = Math.min(1, Math.max(0, t));
+        const v = getOrAddVertex(s.x1 + tc * dx, s.y1 + tc * dy);
+        addCurveVert(segVerts[i], v.id);
+        addCurveVert(lineVerts[j], v.id);
+      }
+    }
+  }
+
+  // Segment x Segment
+  for (let i = 0; i < segments.length; i++) {
+    const a = segments[i];
+    const adx = a.x2 - a.x1;
+    const ady = a.y2 - a.y1;
+    for (let j = i + 1; j < segments.length; j++) {
+      const b = segments[j];
+      const bdx = b.x2 - b.x1;
+      const bdy = b.y2 - b.y1;
+      const den = adx * bdy - ady * bdx;
+      if (Math.abs(den) < 1e-12) continue;
+      const t = ((b.x1 - a.x1) * bdy - (b.y1 - a.y1) * bdx) / den;
+      const u = ((b.x1 - a.x1) * ady - (b.y1 - a.y1) * adx) / den;
+      if (t >= -1e-6 && t <= 1 + 1e-6 && u >= -1e-6 && u <= 1 + 1e-6) {
+        const tc = Math.min(1, Math.max(0, t));
+        const v = getOrAddVertex(a.x1 + tc * adx, a.y1 + tc * ady);
+        addCurveVert(segVerts[i], v.id);
+        addCurveVert(segVerts[j], v.id);
+      }
+    }
+  }
+
   // Also ensure any vertex that happens to sit on another curve (within V_MERGE_EPS) is registered on it
   for (const v of vertices) {
     for (let i = 0; i < circles.length; i++) {
@@ -395,6 +480,22 @@ export function buildPlanarArrangement(curves: Curve[]): PlanarArrangement {
         const d = Math.abs((v.x - l.x) * l.dy - (v.y - l.y) * l.dx) / n;
         if (d <= V_MERGE_EPS) {
           addCurveVert(lineVerts[i], v.id);
+        }
+      }
+    }
+    for (let i = 0; i < segments.length; i++) {
+      const s = segments[i];
+      const dx = s.x2 - s.x1;
+      const dy = s.y2 - s.y1;
+      const l2 = dx * dx + dy * dy;
+      if (l2 > 1e-12) {
+        const t = ((v.x - s.x1) * dx + (v.y - s.y1) * dy) / l2;
+        if (t >= -1e-4 && t <= 1 + 1e-4) {
+          const tc = Math.min(1, Math.max(0, t));
+          const d = Math.hypot(v.x - (s.x1 + tc * dx), v.y - (s.y1 + tc * dy));
+          if (d <= V_MERGE_EPS) {
+            addCurveVert(segVerts[i], v.id);
+          }
         }
       }
     }
@@ -529,6 +630,36 @@ export function buildPlanarArrangement(curves: Curve[]): PlanarArrangement {
       .map((vid) => {
         const v = vertices[vid];
         return { v, u: (v.x - l.x) * ux + (v.y - l.y) * uy };
+      })
+      .sort((a, b) => a.u - b.u);
+
+    const uniq: typeof sorted = [];
+    for (const item of sorted) {
+      if (uniq.length === 0 || item.u - uniq[uniq.length - 1].u > V_MERGE_EPS) {
+        uniq.push(item);
+      }
+    }
+
+    for (let k = 0; k + 1 < uniq.length; k++) {
+      addEdgePair(uniq[k].v, uniq[k + 1].v, 'seg', 0, 0, 0, 0, 0);
+    }
+  }
+
+  // Split polygon finite segments between consecutive vertices
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    const vids = segVerts[i];
+    if (vids.length < 2) continue;
+    const dx = s.x2 - s.x1;
+    const dy = s.y2 - s.y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    const ux = dx / len;
+    const uy = dy / len;
+    const sorted = vids
+      .map((vid) => {
+        const v = vertices[vid];
+        return { v, u: (v.x - s.x1) * ux + (v.y - s.y1) * uy };
       })
       .sort((a, b) => a.u - b.u);
 
@@ -850,6 +981,72 @@ export function buildPlanarArrangement(curves: Curve[]): PlanarArrangement {
  */
 export function snapSeedToCurveCenter(cv: Curve, x: number, y: number): { x: number; y: number } {
   if (cv.t === 'c') return { x: cv.x, y: cv.y };
+  if (cv.t === 'p') return { x: cv.cx, y: cv.cy };
   const p = projectOnCurve(cv, x, y);
   return { x: p.x, y: p.y };
 }
+
+function isPointInClosedCurve(x: number, y: number, cv: CircleCurve | PolyCurve): boolean {
+  if (cv.t === 'c') {
+    return Math.hypot(x - cv.x, y - cv.y) < cv.r - 1e-6;
+  }
+  let inside = false;
+  const vs = cv.verts;
+  for (let i = 0, j = vs.length - 1; i < vs.length; j = i++) {
+    const xi = vs[i].x;
+    const yi = vs[i].y;
+    const xj = vs[j].x;
+    const yj = vs[j].y;
+    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+export function combineClosedCurvesAsShape(
+  curvesInOrder: Array<CircleCurve | PolyCurve>,
+  op: CombineShapeOp,
+  phaseId: string,
+  id: string,
+  scope: 'phase' | 'all'
+): BuiltShape | null {
+  if (curvesInOrder.length < 2) return null;
+  const arr = buildPlanarArrangement(curvesInOrder);
+  if (arr.regions.length === 0) return null;
+
+  const matchedIds = new Set<string>();
+  const seeds: Array<{ x: number; y: number }> = [];
+
+  for (const reg of arr.regions) {
+    const insideFlags = curvesInOrder.map((cv) => isPointInClosedCurve(reg.seed.x, reg.seed.y, cv));
+    const count = insideFlags.filter(Boolean).length;
+    let keep = false;
+    if (op === 'union') {
+      keep = count >= 1;
+    } else if (op === 'intersect') {
+      keep = count === curvesInOrder.length;
+    } else if (op === 'subtract') {
+      keep = insideFlags[0] && insideFlags.slice(1).every((f) => !f);
+    } else {
+      keep = count % 2 === 1;
+    }
+    if (keep) {
+      matchedIds.add(reg.id);
+      seeds.push(reg.seed);
+    }
+  }
+
+  if (matchedIds.size === 0) return null;
+  const d = arr.buildUnionSvgPath(matchedIds);
+  if (!d) return null;
+
+  return {
+    id,
+    phaseId,
+    seeds,
+    d,
+    scope,
+  };
+}
+
