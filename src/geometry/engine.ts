@@ -4901,10 +4901,12 @@ export function distributeObjects(
   objs: GeomObj[],
   selectedIds: Set<number>,
   axis: DistributeAxis,
-  isObjLocked?: (objs: GeomObj[], id: number) => boolean
+  isObjLocked?: (objs: GeomObj[], id: number) => boolean,
+  gapOverride?: number
 ): { ok: boolean; next?: GeomObj[] } {
   const units = buildLayoutUnits(objs, selectedIds);
-  if (units.length < 3) return { ok: false };
+  const hasGap = gapOverride !== undefined && Number.isFinite(gapOverride) && gapOverride >= 0;
+  if (units.length < (hasGap ? 2 : 3)) return { ok: false };
 
   const sorted = [...units].sort((a, b) =>
     axis === 'horiz'
@@ -4918,50 +4920,74 @@ export function distributeObjects(
   let anyChanged = false;
 
   if (axis === 'horiz') {
-    const totalSpan = last.bounds.maxX - first.bounds.minX;
-    const sumW = sorted.reduce((acc, u) => acc + u.bounds.width, 0);
-    if (totalSpan >= sumW - 1e-6) {
-      const gap = (totalSpan - sumW) / (sorted.length - 1);
-      let cursor = first.bounds.maxX + gap;
-      for (let i = 1; i < sorted.length - 1; i++) {
+    if (hasGap) {
+      let cursor = first.bounds.maxX + gapOverride!;
+      for (let i = 1; i < sorted.length; i++) {
         const u = sorted[i];
         const dx = cursor - u.bounds.minX;
         if (translateUnitInPlace(next, u.objIds, dx, 0, movedPts, isObjLocked)) {
           anyChanged = true;
         }
-        cursor += u.bounds.width + gap;
+        cursor += u.bounds.width + gapOverride!;
       }
     } else {
-      const step = (last.bounds.cx - first.bounds.cx) / (sorted.length - 1);
-      for (let i = 1; i < sorted.length - 1; i++) {
-        const u = sorted[i];
-        const targetCx = first.bounds.cx + i * step;
-        if (translateUnitInPlace(next, u.objIds, targetCx - u.bounds.cx, 0, movedPts, isObjLocked)) {
-          anyChanged = true;
+      const totalSpan = last.bounds.maxX - first.bounds.minX;
+      const sumW = sorted.reduce((acc, u) => acc + u.bounds.width, 0);
+      if (totalSpan >= sumW - 1e-6) {
+        const gap = (totalSpan - sumW) / (sorted.length - 1);
+        let cursor = first.bounds.maxX + gap;
+        for (let i = 1; i < sorted.length - 1; i++) {
+          const u = sorted[i];
+          const dx = cursor - u.bounds.minX;
+          if (translateUnitInPlace(next, u.objIds, dx, 0, movedPts, isObjLocked)) {
+            anyChanged = true;
+          }
+          cursor += u.bounds.width + gap;
+        }
+      } else {
+        const step = (last.bounds.cx - first.bounds.cx) / (sorted.length - 1);
+        for (let i = 1; i < sorted.length - 1; i++) {
+          const u = sorted[i];
+          const targetCx = first.bounds.cx + i * step;
+          if (translateUnitInPlace(next, u.objIds, targetCx - u.bounds.cx, 0, movedPts, isObjLocked)) {
+            anyChanged = true;
+          }
         }
       }
     }
   } else {
-    const totalSpan = last.bounds.maxY - first.bounds.minY;
-    const sumH = sorted.reduce((acc, u) => acc + u.bounds.height, 0);
-    if (totalSpan >= sumH - 1e-6) {
-      const gap = (totalSpan - sumH) / (sorted.length - 1);
-      let cursor = first.bounds.maxY + gap;
-      for (let i = 1; i < sorted.length - 1; i++) {
+    if (hasGap) {
+      let cursor = first.bounds.maxY + gapOverride!;
+      for (let i = 1; i < sorted.length; i++) {
         const u = sorted[i];
         const dy = cursor - u.bounds.minY;
         if (translateUnitInPlace(next, u.objIds, 0, dy, movedPts, isObjLocked)) {
           anyChanged = true;
         }
-        cursor += u.bounds.height + gap;
+        cursor += u.bounds.height + gapOverride!;
       }
     } else {
-      const step = (last.bounds.cy - first.bounds.cy) / (sorted.length - 1);
-      for (let i = 1; i < sorted.length - 1; i++) {
-        const u = sorted[i];
-        const targetCy = first.bounds.cy + i * step;
-        if (translateUnitInPlace(next, u.objIds, 0, targetCy - u.bounds.cy, movedPts, isObjLocked)) {
-          anyChanged = true;
+      const totalSpan = last.bounds.maxY - first.bounds.minY;
+      const sumH = sorted.reduce((acc, u) => acc + u.bounds.height, 0);
+      if (totalSpan >= sumH - 1e-6) {
+        const gap = (totalSpan - sumH) / (sorted.length - 1);
+        let cursor = first.bounds.maxY + gap;
+        for (let i = 1; i < sorted.length - 1; i++) {
+          const u = sorted[i];
+          const dy = cursor - u.bounds.minY;
+          if (translateUnitInPlace(next, u.objIds, 0, dy, movedPts, isObjLocked)) {
+            anyChanged = true;
+          }
+          cursor += u.bounds.height + gap;
+        }
+      } else {
+        const step = (last.bounds.cy - first.bounds.cy) / (sorted.length - 1);
+        for (let i = 1; i < sorted.length - 1; i++) {
+          const u = sorted[i];
+          const targetCy = first.bounds.cy + i * step;
+          if (translateUnitInPlace(next, u.objIds, 0, targetCy - u.bounds.cy, movedPts, isObjLocked)) {
+            anyChanged = true;
+          }
         }
       }
     }

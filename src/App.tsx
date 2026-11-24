@@ -3,6 +3,7 @@ import { AlertTriangle, X } from 'lucide-react';
 import { CanvasStage, type MarqueeBox } from './components/CanvasStage';
 import { PHASE_COLOR_PALETTE, type PhaseCounts } from './components/PhaseTimeline';
 import { Toolbar } from './components/Toolbar';
+import { Studio3DView } from './components/Studio3DView';
 import {
   DEFAULT_SNAP_PX,
   DEFAULT_SVG_OVERLAP_PX,
@@ -443,6 +444,7 @@ export default function App() {
   const [activeRefId, setActiveRefId] = useState<string | null>(null);
   const [dark, setDark] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [showStudio3D, setShowStudio3D] = useState(false);
   const [histLen, setHistLen] = useState(0);
   const [redoLen, setRedoLen] = useState(0);
   const [isPanning, setIsPanning] = useState(false);
@@ -1785,11 +1787,11 @@ export default function App() {
   );
 
   const handleDistributeSelection = useCallback(
-    (axis: DistributeAxis) => {
+    (axis: DistributeAxis, gapPx?: number) => {
       const curObjs = objsRef.current;
       const sel = selectedIdsRef.current;
       if (sel.size === 0) return;
-      const res = distributeObjects(curObjs, sel, axis, (list, id) => isObjLocked(list, id));
+      const res = distributeObjects(curObjs, sel, axis, (list, id) => isObjLocked(list, id), gapPx);
       if (!res.ok || !res.next) {
         const anyUnlocked = Array.from(sel).some((id) => !isObjLocked(curObjs, id));
         if (!anyUnlocked) notifyLocked();
@@ -4352,7 +4354,7 @@ export default function App() {
         targets.push({ id, hx: cv.x, hy: cv.y });
       }
     }
-    if (targets.length < 2) return;
+    if (targets.length < 1) return;
     setSelectedIds(new Set());
     setSelectedShapeIds(new Set());
     setTool('ci');
@@ -4862,7 +4864,17 @@ export default function App() {
             return nextVal;
           });
         }}
+        onOpenStudio3D={() => setShowStudio3D(true)}
       />
+
+      {showStudio3D && (
+        <Studio3DView
+          objs={objs}
+          shapes={shapes}
+          dark={dark}
+          onClose={() => setShowStudio3D(false)}
+        />
+      )}
 
       <div className="relative flex-1 min-h-0 flex">
         <CanvasStage
@@ -5031,7 +5043,6 @@ export default function App() {
           onUngroupSelection={handleUngroupSelection}
           onCombineSelectedShapes={handleCombineSelectedShapes}
           onMirrorSelection={handleMirrorSelection}
-          onRadialArraySelection={handleRadialArraySelection}
           onToggleScaleLockSelection={handleToggleScaleLockSelection}
         />
 

@@ -198,12 +198,11 @@ interface CanvasStageProps {
   alignPopoverOpen: boolean;
   onToggleAlignPopover: () => void;
   onAlignSelection: (mode: AlignMode) => void;
-  onDistributeSelection: (axis: DistributeAxis) => void;
+  onDistributeSelection: (axis: DistributeAxis, gapPx?: number) => void;
   onGroupSelection: () => void;
   onUngroupSelection: () => void;
   onCombineSelectedShapes: (op: CombineShapeOp) => void;
   onMirrorSelection: (axis: MirrorAxis) => void;
-  onRadialArraySelection: (count: number) => void;
   onToggleScaleLockSelection: () => void;
 }
 
@@ -1084,7 +1083,6 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
   onUngroupSelection,
   onCombineSelectedShapes,
   onMirrorSelection,
-  onRadialArraySelection,
   onToggleScaleLockSelection,
 }) => {
   const vbW = Math.max(1, size.w) / view.k;
@@ -3240,8 +3238,9 @@ export const CanvasStage: React.FC<CanvasStageProps> = ({
               onUngroup={onUngroupSelection}
               onCombineShapes={onCombineSelectedShapes}
               onMirror={onMirrorSelection}
-              onRadialArray={onRadialArraySelection}
               onToggleScaleLock={onToggleScaleLockSelection}
+              onStartTan={onStartTanFromSelection}
+              onDuplicate={onDuplicateSelected}
             />
           )}
 
